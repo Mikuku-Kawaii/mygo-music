@@ -35,7 +35,7 @@ func (s *served) count(of map[string]int, key string) int {
 	return of[key]
 }
 
-func servedQueue(t *testing.T, ids ...string) (*Player, chan func(), *served, []music.Track) {
+func servedQueue(t *testing.T, ids ...string) (*playbackState, chan func(), *served, []music.Track) {
 	t.Helper()
 	b, err := os.ReadFile("testdata/seek.mp3")
 	if err != nil {
@@ -51,7 +51,7 @@ func servedQueue(t *testing.T, ids ...string) (*Player, chan func(), *served, []
 	t.Cleanup(srv.Close)
 	src.url = srv.URL
 	ch := make(chan func(), 64)
-	p := New(func(fn func()) { ch <- fn })
+	p := newPlaybackState(func(fn func()) { ch <- fn })
 	p.SetVolume(0)
 	p.Source = func(string) music.Source { return src }
 	t.Cleanup(p.stop)

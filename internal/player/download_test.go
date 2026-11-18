@@ -40,7 +40,7 @@ func TestSaveSong(t *testing.T) {
 	defer srv.Close()
 	var asked int
 	src := streamer{st: music.Stream{URL: srv.URL, Type: "flac", Headers: map[string]string{"Authorization": "Bearer token"}}, asked: &asked}
-	p := New(func(func()) {})
+	p := newPlaybackState(func(func()) {})
 	p.Cache = NewCache(t.TempDir(), 1<<30)
 	dir := t.TempDir()
 
@@ -96,7 +96,7 @@ func TestSaveSongCutShort(t *testing.T) {
 	path := filepath.Join(dir, "song.mp3")
 	os.WriteFile(path, []byte("before"), 0o644)
 
-	song, err := New(func(func()) {}).FindSong(src, music.Track{ID: "1", Source: "src"}, "high")
+	song, err := newPlaybackState(func(func()) {}).FindSong(src, music.Track{ID: "1", Source: "src"}, "high")
 	if err != nil {
 		t.Fatal(err)
 	}

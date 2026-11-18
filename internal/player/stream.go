@@ -16,6 +16,7 @@ import (
 	"github.com/egoist/mygo/audio"
 	gomp3 "github.com/hajimehoshi/go-mp3"
 
+	"mygo-music/internal/audioengine/analysis"
 	"mygo-music/internal/music"
 )
 
@@ -242,6 +243,15 @@ func (d *download) Progress() float64 {
 		return 0
 	}
 	return float64(d.n) / float64(d.size)
+}
+
+func (d *download) inFlight() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return !d.done
 }
 
 // waitFor waits until n bytes are in, or the download ended, and returns
@@ -665,7 +675,7 @@ func frameSize(b []byte) int {
 
 const (
 	fftSize      = 1024
-	Bands        = 24
+	Bands        = analysis.Bands
 	spectrumKeep = 10 * time.Second
 )
 
@@ -743,7 +753,7 @@ func (s *spectrum) analyze(chunk int64) {
 	for i, v := range s.acc {
 		s.fft[i] = complex(float64(v*s.window[i]), 0)
 	}
-	fft(s.fft)
+	analysis.FFT(s.fft)
 	var bands [Bands]float32
 	for b := range Bands {
 		var sum float64
@@ -774,30 +784,4 @@ func (s *spectrum) at(frame int64) ([Bands]float32, bool) {
 		return [Bands]float32{}, false
 	}
 	return m.bands, true
-}
-
-// fft transforms x in place; len(x) is a power of two.
-func fft(x []complex128) {
-	n := len(x)
-	for i, j := 1, 0; i < n; i++ {
-		bit := n >> 1
-		for ; j&bit != 0; bit >>= 1 {
-			j ^= bit
-		}
-		j ^= bit
-		if i < j {
-			x[i], x[j] = x[j], x[i]
-		}
-	}
-	for size := 2; size <= n; size <<= 1 {
-		w := cmplx.Exp(complex(0, -2*math.Pi/float64(size)))
-		for start := 0; start < n; start += size {
-			wk := complex(1, 0)
-			for k := range size / 2 {
-				a, b := x[start+k], x[start+k+size/2]*wk
-				x[start+k], x[start+k+size/2] = a+b, a-b
-				wk *= w
-			}
-		}
-	}
 }

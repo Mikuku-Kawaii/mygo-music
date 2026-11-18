@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 
 	"github.com/egoist/mygo"
@@ -15,7 +16,11 @@ func newSongCache(mb int) *player.Cache {
 	if err != nil {
 		return nil
 	}
-	return player.NewCache(filepath.Join(dir, "songs"), int64(mb)<<20)
+	var previousSongs string
+	if root, err := os.UserCacheDir(); err == nil {
+		previousSongs = filepath.Join(root, "PrismPlayer", "songs")
+	}
+	return player.NewCacheWithFallback(filepath.Join(dir, "songs"), int64(mb)<<20, previousSongs)
 }
 
 // applyCacheLimit gives the cache the limit the settings say.

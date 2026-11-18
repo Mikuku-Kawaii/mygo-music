@@ -128,7 +128,7 @@ func (s *remoteFake) set(st *music.RemoteState, err error) {
 // of what it posts, counting what would redraw, and polls that run when told.
 type remoteRig struct {
 	t      *testing.T
-	p      *Player
+	p      *playbackState
 	src    *remoteFake
 	posted chan func()
 	quiet  chan func()
@@ -139,7 +139,7 @@ type remoteRig struct {
 
 func newRemoteRig(t *testing.T, n int) *remoteRig {
 	r := &remoteRig{t: t, src: &remoteFake{cmd: make(chan string, 64)}, posted: make(chan func(), 64), quiet: make(chan func(), 64), now: time.Unix(1000, 0)}
-	r.p = New(func(fn func()) { r.posted <- fn })
+	r.p = newPlaybackState(func(fn func()) { r.posted <- fn })
 	r.p.Quiet = func(fn func()) { r.quiet <- fn }
 	r.p.Source = func(id string) music.Source {
 		if id == "remote" {
@@ -522,7 +522,7 @@ func TestRemoteErrors(t *testing.T) {
 func TestRemoteSignIn(t *testing.T) {
 	src := &remoteFake{cmd: make(chan string, 8), playErr: music.ErrSignIn}
 	posted := make(chan func(), 16)
-	p := New(func(fn func()) { posted <- fn })
+	p := newPlaybackState(func(fn func()) { posted <- fn })
 	p.Source = func(string) music.Source { return src }
 	var failed error
 	p.Failed = func(source string, err error) { failed = err }
@@ -549,7 +549,7 @@ func TestRemoteSignIn(t *testing.T) {
 func TestRemoteRestoreWaits(t *testing.T) {
 	src := &remoteFake{cmd: make(chan string, 8)}
 	posted := make(chan func(), 16)
-	p := New(func(fn func()) { posted <- fn })
+	p := newPlaybackState(func(fn func()) { posted <- fn })
 	p.Source = func(string) music.Source { return src }
 	p.after = func(time.Duration, func()) {}
 	p.Restore(Session{Queue: []music.Track{{ID: "a", Source: "remote", Duration: 200000}}, Order: []int{0}, At: 0, Position: 42000})
@@ -572,7 +572,7 @@ func TestRemoteRestoreWaits(t *testing.T) {
 // A source that can't be found says so, rather than crashing the queue.
 func TestSourceGone(t *testing.T) {
 	posted := make(chan func(), 16)
-	p := New(func(fn func()) { posted <- fn })
+	p := newPlaybackState(func(fn func()) { posted <- fn })
 	p.Source = func(string) music.Source { return nil }
 	p.PlayQueue([]music.Track{{ID: "a", Source: "gone"}}, 0)
 	deadline := time.Now().Add(2 * time.Second)

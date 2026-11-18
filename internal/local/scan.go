@@ -26,12 +26,14 @@ import (
 	"github.com/dhowden/tag"
 	"github.com/egoist/mygo/audio/mp4"
 	"golang.org/x/text/encoding/simplifiedchinese"
+	"mygo-music/internal/audioengine/decode"
+	"mygo-music/internal/audioengine/dsd"
+	"mygo-music/internal/audioengine/dsp"
+	"mygo-music/internal/music"
 )
 
 const (
-	// indexVersion changes when what's kept of a file does, for all of them to
-	// be read again.
-	indexVersion = 2
+	indexVersion = 5
 	// scanBatch is how many newly read files make a scan show what it has.
 	scanBatch = 300
 	// indexEvery is how often a long scan saves what it has, for quitting not to
@@ -54,8 +56,18 @@ func (s *Source) loadIndex(folders []string) []entry {
 		return nil
 	}
 	var index indexFile
-	if err := json.Unmarshal(b, &index); err != nil || index.Version != indexVersion {
+	if err := json.Unmarshal(b, &index); err != nil || (index.Version != 4 && index.Version != indexVersion) {
 		return nil
+	}
+	if index.Version == 4 {
+		// Retain the old catalog at launch and read existing Ogg files again
+		// on the next scan so it can identify Opus and its granule trim.
+		for i := range index.Tracks {
+			e := &index.Tracks[i]
+			if strings.EqualFold(filepath.Ext(e.Path), ".ogg") {
+				e.Mod = 0
+			}
+		}
 	}
 	return slices.DeleteFunc(index.Tracks, func(e entry) bool {
 		return !slices.ContainsFunc(folders, func(f string) bool { return within(e.Path, f) })
@@ -243,7 +255,7 @@ func walk(ctx context.Context, folders []string) []found {
 				return nil
 			}
 			switch strings.ToLower(filepath.Ext(name)) {
-			case ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac":
+			case ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac", ".dsf", ".dff", ".opus":
 			default:
 				return nil
 			}
@@ -323,7 +335,14 @@ func (s *Source) readFile(file found) (entry, bool) {
 
 	typ := fileType(f, file.path)
 	var track *mp4.Track
+	var bitstream dsd.Info
 	switch typ {
+	case "dsf", "dff":
+		r, err := dsd.Open(context.Background(), f, file.size)
+		if err != nil {
+			return entry{}, false
+		}
+		bitstream = r.Info()
 	case "m4a":
 		var ok bool
 		if track, ok = m4aTrack(f, file.size); !ok {
@@ -340,7 +359,7 @@ func (s *Source) readFile(file found) (entry, bool) {
 		Title: t.title, Artist: t.artist, Album: t.album, AlbumArtist: t.albumArtist,
 		Year: t.year, Track: t.track, Disc: t.disc,
 		Sidecar: file.sidecar,
-		Gain:    t.gain, Peak: t.peak,
+		Gain:    t.replayGain.Track.DB, Peak: t.replayGain.Track.Peak, ReplayGain: t.replayGain,
 	}
 	if e.Title == "" {
 		title, artist := nameOfFile(file.path)
@@ -350,10 +369,25 @@ func (s *Source) readFile(file found) (entry, bool) {
 		}
 	}
 	switch typ {
+	case "dsf", "dff":
+		rate := int64(bitstream.BitRate)
+		e.Duration = bitstream.Bits/rate*1000 + bitstream.Bits%rate*1000/rate
+		e.Audio = music.AudioProperties{Known: true, Container: bitstream.Container, DSDRate: bitstream.BitRate,
+			Rate: bitstream.BitRate, Channels: 2, ValidBits: 1, ContainerBits: 1, Frames: bitstream.Bits,
+			ExactSeek: true, Trimmed: true, SeekMethod: "dsd-block-offset"}
 	case "flac":
 		e.Duration = flacDuration(f)
 	case "ogg":
-		e.Duration = oggDuration(f, file.size)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		i, err := decode.ProbeOpus(ctx, f, file.size)
+		cancel()
+		if err == nil {
+			e.Duration = i.Frames / 48
+			e.Audio = music.AudioProperties{Known: true, Container: i.Container, Rate: i.Format.Rate,
+				Channels: i.SourceChannels, Frames: i.Frames, ExactSeek: i.ExactSeek, Trimmed: i.Trimmed, SeekMethod: i.SeekMethod}
+		} else {
+			e.Duration = oggDuration(f, file.size)
+		}
 	case "wav":
 		e.Duration = wavDuration(f, file.size)
 	case "m4a":
@@ -365,6 +399,17 @@ func (s *Source) readFile(file found) (entry, bool) {
 	}
 	if t.picture != nil {
 		e.Cover = s.keepCover(t.picture)
+	}
+	// Probe only on scan workers. Unsupported native formats remain in the
+	// ordinary catalog, with unknown native capability rather than invented bits.
+	if typ == "wav" || typ == "flac" {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if d, err := decode.Open(ctx, file.path); err == nil {
+			i := d.Info()
+			d.Close()
+			e.Audio = music.AudioProperties{Known: true, Container: i.Container, Rate: i.Format.Rate, Channels: i.Format.Channels, ValidBits: i.Format.ValidBits, ContainerBits: i.Format.ContainerBits, Frames: i.Frames, NativePrecision: i.NativePrecision, ExactSeek: i.ExactSeek, Trimmed: i.Trimmed, SeekMethod: i.SeekMethod}
+		}
+		cancel()
 	}
 	return e, true
 }
@@ -388,7 +433,7 @@ func nameOfFile(path string) (title, artist string) {
 type tags struct {
 	title, artist, album, albumArtist string
 	year, track, disc                 int
-	gain, peak                        float64
+	replayGain                        dsp.Gains
 	lyrics                            string
 	picture                           *tag.Picture
 }
@@ -432,7 +477,7 @@ func readTags(f *os.File, typ string, size int64) (t tags) {
 	t.disc, _ = m.Disc()
 	raw := m.Raw()
 	t.year = yearOf(m.Year(), raw)
-	t.gain, t.peak = replayGain(raw)
+	t.replayGain = replayGain(raw)
 	t.lyrics = m.Lyrics()
 	if t.lyrics == "" {
 		t.lyrics, _ = raw["unsyncedlyrics"].(string)
@@ -520,7 +565,7 @@ func yearOf(year int, raw map[string]any) int {
 
 // replayGain finds the track's replay gain, in decibels, and peak: under their
 // own names in Vorbis comments, and in a TXXX frame of ID3.
-func replayGain(raw map[string]any) (gain, peak float64) {
+func replayGain(raw map[string]any) (gains dsp.Gains) {
 	for key, v := range raw {
 		var text string
 		switch v := v.(type) {
@@ -533,22 +578,35 @@ func replayGain(raw map[string]any) (gain, peak float64) {
 		}
 		switch strings.ToLower(key) {
 		case "replaygain_track_gain":
-			gain = parseGain(text)
+			gains.Track.DB, gains.Track.Present = parseGain(text)
 		case "replaygain_track_peak":
-			peak = parseGain(text)
+			gains.Track.Peak, _ = parseGain(text)
+		case "replaygain_album_gain":
+			gains.Album.DB, gains.Album.Present = parseGain(text)
+		case "replaygain_album_peak":
+			gains.Album.Peak, _ = parseGain(text)
 		}
 	}
-	return gain, peak
+	return gains
 }
 
 // parseGain reads the number of "-6.5 dB".
-func parseGain(text string) float64 {
+func parseGain(text string) (float64, bool) {
 	text = strings.TrimRightFunc(strings.TrimSpace(text), func(r rune) bool { return unicode.IsLetter(r) || unicode.IsSpace(r) })
 	v, err := strconv.ParseFloat(text, 64)
 	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
-		return 0
+		return 0, false
 	}
-	return v
+	return v, true
+}
+
+// NativeReplayGain exposes local tags without changing music.Stream's wire
+// representation or applying the compatibility mixer's normalization.
+func (s *Source) NativeReplayGain(id string) dsp.Gains {
+	if item := s.cat.Load().byID[id]; item != nil {
+		return item.ReplayGain
+	}
+	return dsp.Gains{}
 }
 
 // keepCover writes a picture to where covers are, under what's in it, for a
@@ -618,8 +676,10 @@ func fileType(f io.ReaderAt, path string) string {
 		return "mp3"
 	}
 	switch ext := strings.ToLower(filepath.Ext(path)); ext {
-	case ".flac", ".ogg", ".wav", ".m4a", ".aac":
+	case ".flac", ".ogg", ".wav", ".m4a", ".aac", ".dsf", ".dff":
 		return ext[1:]
+	case ".opus":
+		return "ogg"
 	}
 	return "mp3"
 }

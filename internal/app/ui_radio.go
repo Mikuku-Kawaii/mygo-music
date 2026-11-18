@@ -101,7 +101,7 @@ func (a *app) playStation(lib *library, st *music.Station) {
 			a.toast = T("This station can't play right now. Try again later.")
 			return
 		}
-		a.pl.PlayRadio(name, tracks, feed)
+		a.pl.PlayRadio(name, tracks, a.playbackRadioFeed(name))
 	})
 }
 

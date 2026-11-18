@@ -24,7 +24,7 @@ type Song struct {
 // FindSong finds track t of src at quality, to save, as the player would play
 // it: kept in the cache, or as src streams it. It blocks, for src is asked; run
 // it off the main thread, and close what it returns, or save it.
-func (p *Player) FindSong(src music.Source, t music.Track, quality string) (*Song, error) {
+func (p *playbackState) FindSong(src music.Source, t music.Track, quality string) (*Song, error) {
 	if f, st, ok := p.Cache.find(t.Source, t.ID, quality); ok {
 		return &Song{Type: st.Type, file: f}, nil
 	}

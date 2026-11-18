@@ -105,6 +105,10 @@ func TestBackdropFadeEnds(t *testing.T) {
 	a.art.art[sized("b", 600)+"#backdrop"] = &artwork{tint: ui.RGB(40, 40, 200)}
 	q := a.pl.Queue()
 	q[1].Album.ImageURL, q[2].Album.ImageURL = "a", "b"
+	// Queue is now an owned snapshot: install the fixture explicitly instead
+	// of mutating the controller through a returned slice.
+	a.pl.Cue(q)
+	a.pl.Jump(1)
 	tt.Frame()
 	a.pl.Next()
 	tt.Frame()

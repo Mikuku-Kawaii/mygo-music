@@ -84,12 +84,12 @@ func (a *app) restoreSession() {
 		return
 	}
 	var s player.Session
-	if json.Unmarshal(b, &s) != nil {
+	if json.Unmarshal(b, &s) != nil || s.Validate() != nil {
 		return
 	}
 	a.savedSession = string(b)
 	a.pl.Restore(s)
 	if s.Radio != "" && a.pl.Current() != nil {
-		a.pl.AttachRadio(s.Radio, a.radioFeed(s.Radio))
+		a.pl.AttachRadio(s.Radio, a.playbackRadioFeed(s.Radio))
 	}
 }

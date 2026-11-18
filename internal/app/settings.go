@@ -9,11 +9,14 @@ import (
 	"github.com/egoist/mygo"
 
 	"mygo-music/internal/i18n"
+	"mygo-music/internal/player"
 )
 
 // settings are the listener's choices, kept in settings.json in the user
 // data directory.
 type settings struct {
+	AudioOutput player.OutputPreferences `json:"audioOutput,omitzero"`
+	DSPPresets  []dspPreset              `json:"dspPresets,omitempty"`
 	// Language is what the app speaks: i18n.English or i18n.Chinese, or
 	// i18n.System for the system's.
 	Language string `json:"language"`
@@ -85,7 +88,8 @@ type settings struct {
 	// keeps none.
 	CacheMB int `json:"cacheMB"`
 	// SearchHistory keeps submitted keywords, most recent first.
-	SearchHistory []string `json:"searchHistory,omitempty"`
+	SearchHistory  []string `json:"searchHistory,omitempty"`
+	DownloadFolder string   `json:"downloadFolder,omitempty"`
 
 	path string // where they were loaded from, and are saved to
 }

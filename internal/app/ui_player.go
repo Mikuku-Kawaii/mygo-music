@@ -31,13 +31,23 @@ func secs(s float64) time.Duration { return time.Duration(s * float64(time.Secon
 func (a *app) scrubber(c *ui.Context, st *scrubState, track, fill ui.Color, height float32, smoke ui.Color) ui.Element {
 	pl := a.pl
 	dur := pl.Duration().Seconds()
+	canSeek := pl.CanSeek()
+	if !canSeek {
+		st.active, st.held = false, false
+	}
 	if !st.active && !st.held {
 		st.v = pl.Position().Seconds()
 	}
-	s := ui.SliderBase(c, &st.v, 0, max(dur, 1)).Height(height).FocusRing(false).Label(T("Progress")).Cursor(ui.CursorPointer)
+	s := ui.SliderBase(c, &st.v, 0, max(dur, 1)).Disabled(!canSeek).Height(height).FocusRing(false).Label(T("Progress")).Cursor(ui.CursorPointer)
+	if !canSeek {
+		s.Tooltip(T("Seeking becomes available when the native decoder is ready"))
+	}
 	// The press and its release come to the bar wherever the pointer is,
 	// and go on to the slider, which follows the pointer.
 	s.HandleInput(func(ev ui.InputEvent) bool {
+		if !canSeek {
+			return false
+		}
 		switch ev.Kind {
 		case ui.InputPointerDown:
 			st.held = ev.Button == 0
@@ -58,7 +68,7 @@ func (a *app) scrubber(c *ui.Context, st *scrubState, track, fill ui.Color, heig
 	case s.Changed():
 		pl.Seek(secs(min(st.v, max(0, dur-1))))
 	}
-	hot := s.Hovered() || pressed
+	hot := canSeek && (s.Hovered() || pressed)
 	thick := float32(4)
 	if hot {
 		thick = 6
@@ -178,6 +188,12 @@ func (a *app) tickTimes(c *ui.Context) {
 // percent over it. The wheel over the speaker turns it up and down
 // without opening it.
 func (a *app) volumeButton(c *ui.Context, color ui.Color) {
+	if !a.pl.CanAdjustVolume() {
+		if ui.Button(c.Key("unity-volume"), "1:1").Size(32, 32).MinWidth(0).Padding(0).Shrink(0).Label(T("Unity gain · adjust volume on your device")).Clicked() {
+			a.openAudioSettings()
+		}
+		return
+	}
 	b := iconButton(c.Key("volume-button"), volumeIcon(a.volume), 16, color, T("Volume"))
 	if b.Clicked() {
 		a.volumeOpen = !a.volumeOpen
@@ -257,6 +273,9 @@ const wheelVolumeStep = 0.03
 // system's lines-per-notch setting, so a notch was a third of the volume
 // on some machines.
 func (a *app) scrollVolume(ev ui.InputEvent) bool {
+	if !a.pl.CanAdjustVolume() {
+		return false
+	}
 	if ev.Kind != ui.InputScroll {
 		return false
 	}
@@ -293,6 +312,9 @@ func volumeIcon(v float64) *ui.SVG {
 
 // muteButton is the speaker, which mutes and unmutes.
 func (a *app) muteButton(c *ui.Context, color ui.Color) {
+	if !a.pl.CanAdjustVolume() {
+		return
+	}
 	icon := iconVolume
 	if a.volume == 0 {
 		icon = iconMute
@@ -309,6 +331,13 @@ func (a *app) muteButton(c *ui.Context, color ui.Color) {
 
 // volumeSlider is a slim slider with the speaker before it, which mutes.
 func (a *app) volumeSlider(c *ui.Context, color, track ui.Color, width float32) {
+	if !a.pl.CanAdjustVolume() {
+		ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
+			ui.Text(c, T("Unity gain")).FontSize(12).TextColor(color)
+			a.audioOutputButton(c, color)
+		})
+		return
+	}
 	ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 		a.muteButton(c, color)
 		s := ui.SliderBase(c.Key("volume"), &a.volume, 0, 1).Width(width).Height(16).FocusRing(false).Label(T("Volume"))
@@ -378,7 +407,7 @@ func (a *app) playerBar(c *ui.Context) {
 	// The controls keep the middle, between sides that share what is left:
 	// narrower, the middle gives up to 140 DIPs, and what plays keeps room
 	// for its cover, some of its title and its heart.
-	const controls = 3*32 + 2*4 // lyrics, queue and the speaker
+	const controls = 4*32 + 3*4 // lyrics, queue, output and the speaker
 	ui.Row(c).Absolute().Left(0).Right(0).Bottom(0).Height(playerBarHeight).PaddingX(20).Gap(20).AlignItems(ui.Center).Children(func() {
 		// What plays.
 		ui.Row(c).Grow(1).Basis(0).MinWidth(150).Children(func() {
@@ -437,7 +466,7 @@ func (a *app) playerBar(c *ui.Context) {
 		})
 
 		// Controls over the progress.
-		ui.Column(c).Width(440).Shrink(1).MinWidth(300).Gap(0).AlignItems(ui.Stretch).Children(func() {
+		ui.Column(c).Width(440).Shrink(1).MinWidth(260).Gap(0).AlignItems(ui.Stretch).Children(func() {
 			a.transport(c, p.text, p.muted, p.accent, 18)
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Margin(-4, 0, 0, 0).Children(func() {
 				ui.Text(c, clock(pl.Position())).FontSize(10.5).FontFeatures("tnum").TextColor(p.faint).Width(34).TextAlign(ui.End)
@@ -463,6 +492,7 @@ func (a *app) playerBar(c *ui.Context) {
 				a.nowPlaying, a.npPane = true, paneQueue
 			}
 			a.volumeButton(c, p.text.Alpha(0.75))
+			a.audioOutputButton(c, p.muted)
 		})
 	})
 }

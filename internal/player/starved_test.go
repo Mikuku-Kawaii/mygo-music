@@ -47,7 +47,7 @@ func TestSeekPastWhatsInLoads(t *testing.T) {
 	defer release()
 
 	ch := make(chan func(), 64)
-	p := New(func(fn func()) { ch <- fn })
+	p := newPlaybackState(func(fn func()) { ch <- fn })
 	p.SetVolume(0)
 	var clock atomic.Int64
 	clock.Store(time.Unix(1, 0).UnixNano())

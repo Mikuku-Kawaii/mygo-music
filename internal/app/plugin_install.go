@@ -281,6 +281,9 @@ func (a *app) pluginInstalled(id string) error {
 	a.enabledChanged()
 	if a.library == old {
 		a.library = lib
+		if old.downloads != lib.downloads {
+			a.route = route{page: lib.landingPage(), src: lib.id}
+		}
 		a.startLibrary(lib)
 		a.load(a.route)
 	}
@@ -292,7 +295,7 @@ func (a *app) pluginInstalled(id string) error {
 // comes back. The last one on stays, as there would be nothing to show.
 func (a *app) removePlugin(lib *library) {
 	p := pluginOf(lib)
-	if p == nil || (len(a.libs) == 1 && a.libs[0] == lib) {
+	if p == nil || lib.bundled || (len(a.libs) == 1 && a.libs[0] == lib) {
 		return
 	}
 	a.allLibs = slices.DeleteFunc(slices.Clone(a.allLibs), func(l *library) bool { return l == lib })
@@ -594,6 +597,9 @@ func (a *app) installDialog(c *ui.Context, p palette) {
 // on GitHub, or this computer, as one installed from a folder or dropped in,
 // with none.
 func pluginFrom(lib *library) (from, url string) {
+	if lib.bundled {
+		return T("Built into MyGo Music"), ""
+	}
 	plug := pluginOf(lib)
 	if plug == nil {
 		return "", ""
@@ -661,10 +667,12 @@ func (a *app) pluginMenu(c *ui.Context, lib *library, p palette) {
 		if m.Item(T("Show Folder")).Chosen() {
 			revealFolder(plug.Dir())
 		}
-		m.Separator()
-		last := len(a.libs) == 1 && a.libs[0] == lib
-		if m.Item(T("Remove…")).Disabled(last || a.installer.updating[lib.id]).Chosen() {
-			confirmRemovePlugin(a, lib.name(), func() { a.removePlugin(lib) })
+		if !lib.bundled {
+			m.Separator()
+			last := len(a.libs) == 1 && a.libs[0] == lib
+			if m.Item(T("Remove…")).Disabled(last || a.installer.updating[lib.id]).Chosen() {
+				confirmRemovePlugin(a, lib.name(), func() { a.removePlugin(lib) })
+			}
 		}
 	})
 }

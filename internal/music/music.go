@@ -30,7 +30,8 @@ type Album struct {
 }
 
 type Track struct {
-	ID string `json:"id"`
+	Audio AudioProperties `json:"-"`
+	ID    string          `json:"id"`
 	// Source is the ID of the source the track came from, which it plays
 	// through. The source's own answers leave it out; it's filled in for them.
 	Source   string   `json:"source,omitempty"`
@@ -330,11 +331,12 @@ type SettingOption struct {
 
 // Info is how a source introduces itself.
 type Info struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	Version  string    `json:"version,omitempty"`
-	Playback Playback  `json:"playback"`
-	Settings []Setting `json:"settings,omitempty"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Version   string    `json:"version,omitempty"`
+	Workspace string    `json:"workspace,omitempty"`
+	Playback  Playback  `json:"playback"`
+	Settings  []Setting `json:"settings,omitempty"`
 	// Navigation is the sidebar while the source is active, in this order. With
 	// none, the sidebar has an entry for each of the app's pages the source can do.
 	Navigation []NavItem `json:"navigation,omitempty"`

@@ -1,6 +1,7 @@
 package player
 
 import (
+	"context"
 	"errors"
 	"math"
 	"math/rand/v2"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/audio"
+	"mygo-music/internal/audioengine/analysis"
+	engine "mygo-music/internal/audioengine/controller"
 
 	"mygo-music/internal/i18n"
 	"mygo-music/internal/lyrics"
@@ -23,11 +26,36 @@ const (
 	RepeatOne
 )
 
-// Player plays a queue of tracks, from whichever source each is of. Its
-// methods run on the main thread; loading happens on goroutines, whose results
-// post brings back there.
-type Player struct {
-	post func(func())
+// playbackState is confined to PlaybackController's goroutine. Its post sends
+// worker results to that controller, never to the UI. Tests may drive it alone.
+type playbackState struct {
+	post               func(func())
+	deliver            func(func()) bool
+	runLoad            func(func())
+	loadCancel         context.CancelFunc
+	onSync             func()
+	onAnnounce         func(*music.Track, []byte)
+	onRedraw           func()
+	retire             func(*audio.Player) <-chan struct{}
+	complete           func(func())
+	endPending         bool
+	output             OutputPreferences
+	native             nativeEngine
+	nativeState        engine.Snapshot
+	nativeCommand      uint64
+	nativeEnded        bool
+	nativeAsked        bool
+	nativeNext         *nativeContinuation
+	nativeToken        uint64
+	neteaseAhead       *neteaseAhead
+	neteaseAheadGate   chan struct{}
+	interruptedPlaying bool
+	outputReleased     <-chan struct{}
+	outputGate         chan struct{}
+	openNative         func(engine.Config) (nativeEngine, error)
+	compatibleIdleWait time.Duration
+	nativeAfter        time.Time
+	visual             *analysis.Subscription
 	// Quiet is post without a redraw, for what mostly changes nothing, if set.
 	Quiet func(func())
 	// Source finds the source of an ID, or nil if it's gone.
@@ -46,12 +74,13 @@ type Player struct {
 	// plays changed.
 	Changed func()
 
-	queue   []music.Track
-	order   []int // the queue's indices in play order: shuffled or not
-	at      int   // where in order the current track is, -1 for none
-	shuffle bool
-	repeat  RepeatMode
-	volume  float64
+	queue         []music.Track
+	queueRevision uint64 // queue contents, traversal order and continuation policy
+	order         []int  // the queue's indices in play order: shuffled or not
+	at            int    // where in order the current track is, -1 for none
+	shuffle       bool
+	repeat        RepeatMode
+	volume        float64
 
 	// A radio goes on with the tracks its feed gives, as the queue nears
 	// its end, for as long as nothing else is played.
@@ -64,7 +93,7 @@ type Player struct {
 	track   *music.Track
 	out     *audio.Player
 	stream  stream
-	watch   *watched // stream, as out plays it
+	watch   *watched      // stream, as out plays it
 	info    *music.Stream // what the current track streams
 	fade    fader
 	gain    float64 // the current track's normalizing gain
@@ -77,7 +106,8 @@ type Player struct {
 	lyricsLoaded bool
 
 	// pending holds a seek asked for while the track loads.
-	pending time.Duration
+	pending       time.Duration
+	savedPosition time.Duration // previously confirmed recovery/session position
 	// A seek playing fades out, then lands, then fades in: meanwhile the
 	// position is where it goes.
 	seeking bool
@@ -101,34 +131,23 @@ type Player struct {
 	ahead *ahead // the next track's audio, asked for before its turn
 }
 
-func New(post func(func())) *Player {
-	p := &Player{post: post, at: -1, volume: 0.8, gain: 1}
+func newPlaybackState(post func(func())) *playbackState {
+	p := &playbackState{post: post, at: -1, volume: 0.8, gain: 1}
 	p.after = func(d time.Duration, fn func()) { time.AfterFunc(d, fn) }
 	p.now = time.Now
 	// Music, mixed far enough ahead to play on while macOS keeps the app
 	// waiting, as it does while its appearance changes.
 	audio.SetLatency(audio.LatencyPlayback)
-	// The media keys, and the controls of Control Center.
-	mygo.NowPlaying.OnCommand(func(cmd mygo.MediaCommand, pos time.Duration) {
-		switch cmd {
-		case mygo.MediaPlay, mygo.MediaPause:
-			if (cmd == mygo.MediaPlay) != p.playing {
-				p.TogglePlay()
-			}
-		case mygo.MediaNext:
-			p.Next()
-		case mygo.MediaPrevious:
-			p.Prev()
-		case mygo.MediaSeek:
-			p.Seek(pos)
-		}
-		p.post(func() {})
-	})
+
 	return p
 }
 
 // sync shows the system, and Changed, where playback is.
-func (p *Player) sync() {
+func (p *playbackState) sync() {
+	if p.onSync != nil {
+		p.onSync()
+		return
+	}
 	if p.Changed != nil {
 		defer p.Changed()
 	}
@@ -143,8 +162,20 @@ func (p *Player) sync() {
 	mygo.NowPlaying.SetPlayback(state, p.Position())
 }
 
+func (p *playbackState) redraw() {
+	if p.onRedraw != nil {
+		p.onRedraw()
+		return
+	}
+	p.post(func() {})
+}
+
 // announce shows the system the track, and its cover once loaded.
-func (p *Player) announce(t *music.Track, artwork []byte) {
+func (p *playbackState) announce(t *music.Track, artwork []byte) {
+	if p.onAnnounce != nil {
+		p.onAnnounce(t, artwork)
+		return
+	}
 	state := mygo.PlaybackPaused
 	if p.playing {
 		state = mygo.PlaybackPlaying
@@ -161,8 +192,17 @@ func (p *Player) announce(t *music.Track, artwork []byte) {
 	})
 }
 
-func (p *Player) ended() {
+func (p *playbackState) ended() {
+	// A delayed end callback must not undo a pause accepted at the boundary.
+	if !p.playing {
+		return
+	}
+	p.recordCompletion()
 	if p.repeat == RepeatOne {
+		if p.output.Mode != OutputCompatible {
+			p.loadSkipping(p.at, 0, stay, true, 0)
+			return
+		}
 		p.out.Seek(0)
 		p.out.Play()
 		return
@@ -179,33 +219,51 @@ func (p *Player) ended() {
 	p.Next()
 }
 
+// Compatibility OnEnd reports mixer EOF. Wait for its heard-position API to
+// reach the stream duration before advancing; a UI tick is never involved.
+func (p *playbackState) pollEnd() bool {
+	if !p.endPending || !p.playing || p.seeking || p.out == nil || p.out.Playing() {
+		return false
+	}
+	if end := p.out.Duration(); end > 0 && p.out.Position() < end {
+		return false
+	}
+	p.endPending = false
+	p.ended()
+	return true
+}
+
 // PlayQueue replaces the queue with tracks and plays the one at start, or the
 // first after it that can play.
-func (p *Player) PlayQueue(tracks []music.Track, start int) {
+func (p *playbackState) PlayQueue(tracks []music.Track, start int) {
 	p.playQueue(tracks, start, forward)
 }
 
 // PlayTrack replaces the queue with tracks and plays the one at i, the
 // listener's pick: one that can't play stays, saying why, rather than another
 // playing in its place.
-func (p *Player) PlayTrack(tracks []music.Track, i int) {
+func (p *playbackState) PlayTrack(tracks []music.Track, i int) {
 	p.playQueue(tracks, i, stay)
 }
 
 // PlayShuffled replaces the queue with tracks in a random order, any of them
 // first, and plays it with shuffle on.
-func (p *Player) PlayShuffled(tracks []music.Track) {
+func (p *playbackState) PlayShuffled(tracks []music.Track) {
+	if len(tracks) == 0 {
+		return
+	}
 	p.shuffle = true
 	p.playQueue(tracks, -1, forward)
 }
 
 // playQueue plays tracks from start; a start below 0, when shuffled, lets
 // any track come first.
-func (p *Player) playQueue(tracks []music.Track, start, dir int) {
+func (p *playbackState) playQueue(tracks []music.Track, start, dir int) {
 	if len(tracks) == 0 {
 		return
 	}
 	p.endRadio()
+	p.nativeNext = nil
 	start = min(start, len(tracks)-1)
 	p.queue = append([]music.Track(nil), tracks...)
 	p.order = make([]int, len(p.queue))
@@ -216,13 +274,14 @@ func (p *Player) playQueue(tracks []music.Track, start, dir int) {
 		p.shuffleOrder(start)
 		start = 0
 	}
+	p.queueChanged()
 	p.loadSkipping(max(start, 0), 0, dir, true, 0)
 }
 
 // PlayRadio plays tracks in their order, then goes on with those feed
 // gives as the queue nears its end, until something else is played. The
 // radio's name says which it is. feed calls got on the main thread.
-func (p *Player) PlayRadio(name string, tracks []music.Track, feed func(got func([]music.Track))) {
+func (p *playbackState) PlayRadio(name string, tracks []music.Track, feed func(got func([]music.Track))) {
 	if len(tracks) == 0 {
 		return
 	}
@@ -235,15 +294,17 @@ func (p *Player) PlayRadio(name string, tracks []music.Track, feed func(got func
 
 // AttachRadio makes the queue the radio name's, which feed goes on with,
 // as after restoring a session that played it.
-func (p *Player) AttachRadio(name string, feed func(got func([]music.Track))) {
+func (p *playbackState) AttachRadio(name string, feed func(got func([]music.Track))) {
 	p.endRadio()
 	p.radio, p.feed = name, feed
+	p.queueChanged()
+	p.refreshAhead()
 	p.refill()
 }
 
 // EndRadio stops the radio playing: the song playing plays on, but the
 // songs the radio queued after it go, and it adds no more.
-func (p *Player) EndRadio() {
+func (p *playbackState) EndRadio() {
 	if p.radio == "" && p.feed == nil {
 		return
 	}
@@ -264,24 +325,26 @@ func (p *Player) EndRadio() {
 		p.playing = false
 		p.sync()
 	}
+	p.queueChanged()
+	p.refreshAhead()
 }
 
-func (p *Player) endRadio() {
+func (p *playbackState) endRadio() {
 	p.radioGen++
 	p.radio, p.feed, p.feeding, p.awaiting = "", nil, false, false
 }
 
 // Radio returns the name of the radio playing, or "".
-func (p *Player) Radio() string { return p.radio }
+func (p *playbackState) Radio() string { return p.radio }
 
 // refill asks the radio for more once the queue is near its end.
-func (p *Player) refill() {
+func (p *playbackState) refill() {
 	if p.feed == nil || p.feeding || p.at < len(p.order)-2 {
 		return
 	}
 	p.feeding = true
 	gen := p.radioGen
-	p.feed(func(more []music.Track) {
+	answered := func(more []music.Track) {
 		if gen != p.radioGen {
 			return
 		}
@@ -291,24 +354,34 @@ func (p *Player) refill() {
 		case !p.awaiting:
 		case p.at+1 < len(p.order):
 			p.awaiting = false
-			p.load(p.at + 1)
+			p.loadSkipping(p.at+1, 0, forward, p.playing, 0)
 		default:
 			// The radio has nothing more: it stops at its end.
 			p.awaiting, p.playing = false, false
 			p.err = i18n.T("The station has nothing more right now")
 			p.sync()
 		}
-	})
+	}
+	if p.deliver == nil {
+		p.feed(answered)
+	} else {
+		feed := p.feed
+		go feed(func(more []music.Track) {
+			more = cloneTracks(more)
+			p.deliver(func() { answered(more) })
+		})
+	}
 }
 
 // awaitFeed waits at the end of a radio's queue for what its feed gives.
-func (p *Player) awaitFeed() {
+func (p *playbackState) awaitFeed() {
 	p.awaiting = true
 	p.refill()
 }
 
 // appendTracks adds tracks to the end of the queue, but those in it.
-func (p *Player) appendTracks(tracks []music.Track) {
+func (p *playbackState) appendTracks(tracks []music.Track) {
+	before := len(p.queue)
 	type key struct{ source, id string }
 	in := make(map[key]bool, len(p.queue))
 	for _, t := range p.queue {
@@ -321,11 +394,15 @@ func (p *Player) appendTracks(tracks []music.Track) {
 			p.queue = append(p.queue, t)
 		}
 	}
+	if len(p.queue) != before {
+		p.queueChanged()
+		p.refreshAhead()
+	}
 }
 
 // shuffleOrder puts the order in a random one with first at its head, or
 // with any at its head when first is below 0.
-func (p *Player) shuffleOrder(first int) {
+func (p *playbackState) shuffleOrder(first int) {
 	rand.Shuffle(len(p.order), func(i, j int) { p.order[i], p.order[j] = p.order[j], p.order[i] })
 	for i, v := range p.order {
 		if v == first {
@@ -334,8 +411,9 @@ func (p *Player) shuffleOrder(first int) {
 	}
 }
 
-func (p *Player) ToggleShuffle() {
+func (p *playbackState) ToggleShuffle() {
 	p.shuffle = !p.shuffle
+	defer func() { p.queueChanged(); p.refreshAhead() }()
 	if len(p.order) == 0 {
 		return
 	}
@@ -351,42 +429,75 @@ func (p *Player) ToggleShuffle() {
 	}
 }
 
-func (p *Player) CycleRepeat() { p.repeat = (p.repeat + 1) % 3 }
+func (p *playbackState) CycleRepeat() {
+	p.repeat = (p.repeat + 1) % 3
+	p.queueChanged()
+	p.refreshAhead()
+}
+
+// Queue plans are independent of the selected transport generation. Editing
+// order or policy keeps the current song, but retires its old next-song plan.
+func (p *playbackState) queueChanged() {
+	p.queueRevision++
+	p.dropAhead()
+	p.updateNativePlan()
+	p.sync()
+}
+
+func (p *playbackState) refreshAhead() {
+	if p.native != nil {
+		if p.playing && p.nativeState.EffectivePlaying {
+			p.getNetEaseAhead()
+		} else {
+			p.dropNetEaseAhead()
+		}
+		return
+	}
+	if p.out != nil {
+		quality := music.Qualities[len(music.Qualities)/2]
+		if p.Quality != nil {
+			quality = p.Quality()
+		}
+		p.getAhead(quality)
+	}
+}
 
 // Current returns the track playing or loading, or nil.
-func (p *Player) Current() *music.Track { return p.track }
+func (p *playbackState) Current() *music.Track { return p.track }
 
 // Queue returns the tracks queued, in the order they were given.
-func (p *Player) Queue() []music.Track { return p.queue }
+func (p *playbackState) Queue() []music.Track { return p.queue }
 
 // Playing reports what the listener wants: false while paused.
-func (p *Player) Playing() bool { return p.playing }
+func (p *playbackState) Playing() bool { return p.playing }
 
 // Loading reports whether the current track is still loading.
 // Loading reports whether the current track is on its way: loading, or
 // waiting for the next of its bytes, after a seek past what has come in.
-func (p *Player) Loading() bool {
+func (p *playbackState) Loading() bool {
 	return p.loading || p.awaiting || p.watch != nil && p.watch.starved()
 }
 
 // Ready reports whether the current track has loaded, to play.
-func (p *Player) Ready() bool { return p.out != nil || p.remote != nil && p.remote.started }
+func (p *playbackState) Ready() bool {
+	return p.out != nil || p.remote != nil && p.remote.started || p.native != nil && p.nativeState.Output.Format.Rate > 0 && p.nativeState.State != engine.Failed
+}
 
 // Err returns why the current track did not play, or "".
-func (p *Player) Err() string { return p.err }
+func (p *playbackState) Err() string { return p.err }
 
 // Stream returns what the current track streams, once loaded, or nil.
-func (p *Player) Stream() *music.Stream { return p.info }
+func (p *playbackState) Stream() *music.Stream { return p.info }
 
-func (p *Player) Shuffle() bool      { return p.shuffle }
-func (p *Player) Repeat() RepeatMode { return p.repeat }
+func (p *playbackState) Shuffle() bool      { return p.shuffle }
+func (p *playbackState) Repeat() RepeatMode { return p.repeat }
 
 // Lyrics returns the current track's lyrics, and whether they have loaded.
-func (p *Player) Lyrics() ([]lyrics.Line, bool) { return p.lyrics, p.lyricsLoaded }
+func (p *playbackState) Lyrics() ([]lyrics.Line, bool) { return p.lyrics, p.lyricsLoaded }
 
 // Downloaded returns the share of the current track downloaded so far, or
 // false before it has started to.
-func (p *Player) Downloaded() (float64, bool) {
+func (p *playbackState) Downloaded() (float64, bool) {
 	if p.stream == nil {
 		return 0, false
 	}
@@ -396,12 +507,13 @@ func (p *Player) Downloaded() (float64, bool) {
 
 // PlayOrder returns the queue's indices in play order, and where the
 // current track is among them, -1 for none.
-func (p *Player) PlayOrder() ([]int, int) { return p.order, p.at }
+func (p *playbackState) PlayOrder() ([]int, int) { return p.order, p.at }
 
-func (p *Player) Next() {
+func (p *playbackState) Next() {
 	if len(p.order) == 0 {
 		return
 	}
+	p.syncNativeBoundary()
 	at := p.at + 1
 	if at >= len(p.order) {
 		if p.feed != nil {
@@ -417,10 +529,11 @@ func (p *Player) Next() {
 // Prev plays the track before this one, however far this one has played:
 // once a few seconds in, going back to its start only kept the listener
 // pressing twice.
-func (p *Player) Prev() {
+func (p *playbackState) Prev() {
 	if len(p.order) == 0 {
 		return
 	}
+	p.syncNativeBoundary()
 	at := p.at - 1
 	if at < 0 {
 		at = len(p.order) - 1
@@ -431,7 +544,7 @@ func (p *Player) Prev() {
 
 // Jump plays the queue's track i, the listener's pick: one that can't play
 // stays, saying why.
-func (p *Player) Jump(i int) {
+func (p *playbackState) Jump(i int) {
 	for k, v := range p.order {
 		if v == i {
 			p.loadSkipping(k, 0, stay, true, 0)
@@ -441,14 +554,34 @@ func (p *Player) Jump(i int) {
 }
 
 // TogglePlay pauses, fading out, or plays, fading in.
-func (p *Player) TogglePlay() {
+func (p *playbackState) TogglePlay() {
+	if p.output.Mode != OutputCompatible && p.err != "" && p.at >= 0 {
+		p.loadSkipping(p.at, 0, stay, false, p.Position())
+		return
+	}
+	if p.native != nil {
+		if p.awaiting {
+			p.playing = !p.playing
+			p.sync()
+			return
+		}
+		if p.nativeState.State == engine.Failed {
+			p.loadSkipping(p.at, 0, stay, false, p.Position())
+		} else if p.nativeState.State == engine.Ended && !p.seeking {
+			p.loadSkipping(p.at, 0, stay, true, 0)
+		} else {
+			p.playing = !p.playing
+			p.nativeIntent()
+		}
+		return
+	}
 	if p.remote != nil && p.remote.started {
 		p.remoteToggle()
 		return
 	}
 	if p.out == nil {
 		switch {
-		case p.loading:
+		case p.loading || p.awaiting:
 			// It plays once loaded, or not.
 			p.playing = !p.playing
 			p.sync()
@@ -473,6 +606,7 @@ func (p *Player) TogglePlay() {
 		return
 	}
 	p.playing = true
+	p.endPending = false
 	p.record()
 	if !p.seeking && !out.Playing() {
 		if out.Position() >= out.Duration()-time.Second {
@@ -492,7 +626,12 @@ const seekGap = 30 * time.Millisecond
 // Seek moves to t. Playing, it pauses and plays again around the jump,
 // which the audio player fades over a few milliseconds, rather than
 // cutting from one sound to the other with a click.
-func (p *Player) Seek(t time.Duration) {
+func (p *playbackState) Seek(t time.Duration) {
+	if p.output.Mode != OutputCompatible {
+		p.seekNative(t)
+		return
+	}
+	p.endPending = false
 	if p.remote != nil && p.remote.started {
 		p.remoteSeek(t)
 		return
@@ -503,7 +642,7 @@ func (p *Player) Seek(t time.Duration) {
 	}
 	out := p.out
 	// One past what has come in waits for it: a frame once that would show.
-	p.after(seekGap+starvedAfter+20*time.Millisecond, func() { p.post(func() {}) })
+	p.after(seekGap+starvedAfter+20*time.Millisecond, func() { p.redraw() })
 	// Paused, it jumps at once; but a seek on its way paused it only for
 	// the jump, and this one takes its place, playing on from there.
 	if !out.Playing() && !p.seeking {
@@ -531,8 +670,9 @@ func (p *Player) Seek(t time.Duration) {
 	p.sync()
 }
 
-func (p *Player) SetVolume(v float64) {
+func (p *playbackState) SetVolume(v float64) {
 	p.volume = v
+	p.nativeVolume()
 	p.applyGain()
 	if p.remote != nil {
 		p.remoteVolume(v)
@@ -541,7 +681,7 @@ func (p *Player) SetVolume(v float64) {
 
 // applyGain sets the volume of what plays: the listener's, which the ear
 // hears in powers, and the track's gain, if normalizing.
-func (p *Player) applyGain() {
+func (p *playbackState) applyGain() {
 	g := p.volume * p.volume
 	if p.Normalize != nil && p.Normalize() {
 		g *= p.gain
@@ -566,7 +706,13 @@ func normGain(st *music.Stream) float64 {
 	return g
 }
 
-func (p *Player) Position() time.Duration {
+func (p *playbackState) Position() time.Duration {
+	if p.output.Mode != OutputCompatible {
+		if p.native != nil && p.nativeState.Source.Format.Rate > 0 {
+			return nativeDuration(p.nativeState.PositionFrames, p.nativeState.Source.Format.Rate)
+		}
+		return p.savedPosition // a new seek target is never assigned here
+	}
 	switch {
 	case p.remote != nil && p.remote.started:
 		return p.remotePosition()
@@ -578,7 +724,10 @@ func (p *Player) Position() time.Duration {
 	return p.out.Position()
 }
 
-func (p *Player) Duration() time.Duration {
+func (p *playbackState) Duration() time.Duration {
+	if p.native != nil && p.nativeState.Source.Format.Rate > 0 && p.nativeState.Source.Frames >= 0 {
+		return nativeDuration(uint64(p.nativeState.Source.Frames), p.nativeState.Source.Format.Rate)
+	}
 	switch {
 	case p.track == nil:
 		return 0
@@ -591,7 +740,15 @@ func (p *Player) Duration() time.Duration {
 }
 
 // Levels returns the spectrum of what plays now.
-func (p *Player) Levels() ([Bands]float32, bool) {
+func (p *playbackState) Levels() ([Bands]float32, bool) {
+	if p.output.Mode != OutputCompatible {
+		m := p.nativeState.Measurement
+		if p.visual != nil && m.Valid && m.Token == p.visual.Token() && p.native != nil &&
+			p.playing && !p.loading && p.err == "" {
+			return m.Bands, true
+		}
+		return [Bands]float32{}, false
+	}
 	if p.stream == nil || p.out == nil || !p.playing {
 		return [Bands]float32{}, false
 	}
@@ -600,12 +757,29 @@ func (p *Player) Levels() ([Bands]float32, bool) {
 	return spec.at(frame)
 }
 
-func (p *Player) stop() {
+func (p *playbackState) stop() {
+	p.dropNetEaseAhead()
+	p.endPending = false
+	p.nativeNext = nil
+	if h := p.native; h != nil {
+		done := make(chan struct{})
+		p.outputReleased = done
+		p.native = nil
+		go func() { defer close(done); h.Close() }()
+	}
+	p.nativeState = engine.Snapshot{}
 	if out := p.out; out != nil {
+		// MyGo v0.9.0 keeps its shared sink alive for 5 seconds after its
+		// last voice stops (audio/output.go: idleClose). No public close API.
+		p.nativeAfter = time.Now().Add(p.compatibleIdleWait)
 		// Paused first, it fades out over a few milliseconds, rather than
 		// stopping with a click.
 		out.Pause()
-		time.AfterFunc(100*time.Millisecond, out.Close)
+		if p.retire != nil {
+			p.outputReleased = p.retire(out)
+		} else {
+			time.AfterFunc(100*time.Millisecond, out.Close)
+		}
 	}
 	p.out, p.stream, p.watch, p.info, p.remote = nil, nil, nil, nil, nil
 	p.seeking = false
@@ -621,13 +795,13 @@ const (
 )
 
 // load plays the track at order[at], skipping those that cannot play.
-func (p *Player) load(at int) {
+func (p *playbackState) load(at int) {
 	p.loadSkipping(at, 0, forward, true, 0)
 }
 
 // stopForFeed stops what plays, at the end of a radio's queue, while its feed
 // gives more.
-func (p *Player) stopForFeed() {
+func (p *playbackState) stopForFeed() {
 	if was := p.remote; was != nil && was.started && p.playing {
 		p.command(was.src, was.src.RemotePause)
 	}
@@ -635,7 +809,7 @@ func (p *Player) stopForFeed() {
 }
 
 // sourceOf returns the source of track t, or nil if it's gone.
-func (p *Player) sourceOf(t *music.Track) music.Source {
+func (p *playbackState) sourceOf(t *music.Track) music.Source {
 	if p.Source == nil {
 		return nil
 	}
@@ -644,7 +818,7 @@ func (p *Player) sourceOf(t *music.Track) music.Source {
 
 // record tells the source of the current track, if it wants to know, that it
 // plays, once for each time it's played.
-func (p *Player) record() {
+func (p *playbackState) record() {
 	if p.track == nil || !p.playing {
 		return
 	}
@@ -660,9 +834,18 @@ func (p *Player) record() {
 
 // loadSkipping loads the track at order[at], to play or not, from from,
 // skipping those that cannot play the way dir goes: skipped of them so far.
-func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duration) {
+func (p *playbackState) loadSkipping(at, skipped, dir int, play bool, from time.Duration) {
+	if p.loadCancel != nil {
+		p.loadCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.loadCancel = cancel
 	t := p.queue[p.order[at]]
 	src := p.sourceOf(&t)
+	var neteasePre *neteaseAhead
+	if p.output.Mode != OutputCompatible {
+		neteasePre = p.takeNetEaseAhead(t, src)
+	}
 	if was := p.remote; was != nil && was.started && p.playing && (src == nil || src.Info().ID != was.src.Info().ID) {
 		// Whatever plays next isn't its to play.
 		p.command(was.src, was.src.RemotePause)
@@ -673,15 +856,25 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 	p.at = at
 	p.track = &t
 	p.loading, p.playing, p.err = true, play, ""
+	p.interruptedPlaying = false
 	p.awaiting = false
 	p.lyrics, p.lyricsLoaded = nil, false
 	p.pending = from
+	p.savedPosition = from
 	p.recorded = ""
 	p.announce(&t, nil)
 	p.refill()
 
 	p.loadCover(gen, &t)
 	p.loadLyrics(gen, src, t)
+	if p.output.Mode != OutputCompatible {
+		quality := "lossless"
+		if p.Quality != nil {
+			quality = p.Quality()
+		}
+		p.loadNative(ctx, gen, src, t, quality, neteasePre)
+		return
+	}
 	if src != nil && src.Info().Playback == music.PlaybackRemote {
 		p.loadRemote(gen, src, at, skipped, dir, play, from)
 		return
@@ -691,9 +884,33 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 		quality = p.Quality()
 	}
 	pre := p.takeAhead(t, quality)
-	go func() {
-		info, s, err := p.open(src, t, quality, pre)
-		p.post(func() {
+	cache := p.Cache
+	released, gate := p.outputReleased, p.outputGate
+	work := func() {
+		// Cache/configuration are captured before dispatch; workers never read
+		// mutable control state. Source APIs without context finish cooperatively.
+		opener := &playbackState{Cache: cache}
+		info, s, err := opener.openContext(ctx, src, t, quality, pre)
+		release, gateErr := acquireOutput(ctx, gate)
+		if gateErr == nil {
+			gateErr = waitOutput(ctx, released)
+		}
+		if err == nil {
+			err = gateErr
+		}
+		if ctx.Err() != nil {
+			if release != nil {
+				release()
+			}
+			if s != nil {
+				s.Close()
+			}
+			return
+		}
+		apply := func() {
+			if release != nil {
+				defer release()
+			}
 			if gen != p.gen {
 				if s != nil {
 					s.Close()
@@ -702,12 +919,14 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 			}
 			p.loading = false
 			if err != nil {
-				p.loadFailed(t.Source, err, at, skipped, dir)
+				// Shuffle can move the same selection while its source is opening.
+				// gen still owns the selection, but at may now name another song.
+				p.loadFailed(t.Source, err, p.at, skipped, dir)
 				return
 			}
 			p.stream, p.info = s, info
 			p.gain = normGain(info)
-			p.watch = &watched{stream: s, now: p.now, ended: func() { p.post(func() {}) }}
+			p.watch = &watched{stream: s, now: p.now, ended: func() { p.redraw() }}
 			p.out = audio.NewPlayer(p.watch)
 			// From its middle, as a session picked up again, it fades in.
 			level := 1.0
@@ -718,8 +937,13 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 			p.applyGain()
 			p.out.OnEnd(func() {
 				p.post(func() {
-					if gen == p.gen {
-						p.ended()
+					if gen == p.gen && !p.seeking && p.out != nil && !p.out.Playing() {
+						if p.deliver == nil {
+							p.ended()
+						} else {
+							p.endPending = true
+							p.pollEnd()
+						}
 					}
 				})
 			})
@@ -734,12 +958,29 @@ func (p *Player) loadSkipping(at, skipped, dir int, play bool, from time.Duratio
 			}
 			p.sync()
 			p.getAhead(quality)
-		})
-	}()
+		}
+		if p.deliver != nil {
+			if !p.deliver(apply) {
+				if s != nil {
+					s.Close()
+				}
+				if release != nil {
+					release()
+				}
+			}
+		} else {
+			p.post(apply)
+		}
+	}
+	if p.runLoad != nil {
+		p.runLoad(work)
+	} else {
+		go work()
+	}
 }
 
 // loadCover shows the system the cover of t, once it has it.
-func (p *Player) loadCover(gen int, t *music.Track) {
+func (p *playbackState) loadCover(gen int, t *music.Track) {
 	url := t.Album.ImageURL
 	if url == "" {
 		return
@@ -758,7 +999,7 @@ func (p *Player) loadCover(gen int, t *music.Track) {
 }
 
 // loadLyrics asks the source of t for its lyrics, if it has any.
-func (p *Player) loadLyrics(gen int, src music.Source, t music.Track) {
+func (p *playbackState) loadLyrics(gen int, src music.Source, t music.Track) {
 	go func() {
 		var lines []lyrics.Line
 		if src != nil && src.Can("lyrics") {
@@ -778,7 +1019,7 @@ func (p *Player) loadLyrics(gen int, src music.Source, t music.Track) {
 // loadFailed says why the track at order[at] can't play, and skips it the way
 // dir goes, unless it stays, nothing in the queue can play, or the listener has
 // to do something first, which would stop the next track too.
-func (p *Player) loadFailed(source string, err error, at, skipped, dir int) {
+func (p *playbackState) loadFailed(source string, err error, at, skipped, dir int) {
 	p.err = errorText(err)
 	if errors.Is(err, music.ErrSignIn) || errors.Is(err, music.ErrSetup) {
 		p.playing = false
@@ -822,18 +1063,39 @@ var errNoSource = errors.New("player: no such source")
 // that worked; or kept in the cache, or else a file on disk, played from
 // there, or else streamed into the cache, and kept once it has all come in.
 // What failed ahead is asked for again: it may have been a moment's.
-func (p *Player) open(src music.Source, t music.Track, quality string, pre *ahead) (*music.Stream, stream, error) {
+func (p *playbackState) open(src music.Source, t music.Track, quality string, pre *ahead) (*music.Stream, stream, error) {
+	return p.openContext(context.Background(), src, t, quality, pre)
+}
+
+func (p *playbackState) openContext(ctx context.Context, src music.Source, t music.Track, quality string, pre *ahead) (*music.Stream, stream, error) {
+	if err := ctx.Err(); err != nil {
+		if pre != nil {
+			go pre.close()
+		}
+		return nil, nil, err
+	}
 	if src == nil {
 		if pre != nil {
 			pre.close()
 		}
 		return nil, nil, errNoSource
 	}
+	if t.Source == "local" && (t.Audio.DSDRate != 0 || t.Audio.Container == "Ogg Opus") && NativeOutputAvailable() {
+		if pre != nil {
+			pre.close()
+		}
+		return nil, nil, errors.New(i18n.T("Choose WASAPI Processed in Audio Output to play this format."))
+	}
 	var dl *download
 	var info *music.Stream
 	ok := false
 	if pre != nil {
-		<-pre.done
+		select {
+		case <-pre.done:
+		case <-ctx.Done():
+			go pre.close()
+			return nil, nil, ctx.Err()
+		}
 		if pre.err == nil {
 			info, dl, ok = pre.info, pre.dl, true
 			if dl == nil {
@@ -851,6 +1113,9 @@ func (p *Player) open(src music.Source, t music.Track, quality string, pre *ahea
 	if !ok {
 		var err error
 		info, err = src.Stream(t.ID, quality)
+		if canceled := ctx.Err(); canceled != nil {
+			return nil, nil, canceled
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -866,7 +1131,9 @@ func (p *Player) open(src music.Source, t music.Track, quality string, pre *ahea
 			dl = p.Cache.download(t.Source, t.ID, quality, info)
 		}
 	}
+	stopCancel := context.AfterFunc(ctx, dl.Close)
 	s, err := openStream(dl, t.Duration)
+	stopCancel()
 	if err != nil {
 		dl.Close()
 		return nil, nil, err
@@ -890,6 +1157,8 @@ func openFile(path string) (*download, error) {
 
 // Session is where playback was left, to pick up again.
 type Session struct {
+	Version  int           `json:"version,omitempty"`
+	Paused   bool          `json:"paused"`
 	Queue    []music.Track `json:"queue"`
 	Order    []int         `json:"order"`
 	At       int           `json:"at"`
@@ -900,11 +1169,12 @@ type Session struct {
 }
 
 // Session returns where playback is, or false with nothing queued.
-func (p *Player) Session() (Session, bool) {
+func (p *playbackState) Session() (Session, bool) {
 	if p.track == nil || p.at < 0 {
 		return Session{}, false
 	}
 	return Session{
+		Version: 1, Paused: !p.playing,
 		Queue:    p.queue,
 		Order:    p.order,
 		At:       p.at,
@@ -917,21 +1187,61 @@ func (p *Player) Session() (Session, bool) {
 
 // Restore picks up a session where it was left, paused, and loads its
 // track to play at once when asked.
-func (p *Player) Restore(s Session) {
-	n := len(s.Queue)
-	if n == 0 || len(s.Order) != n || s.At < 0 || s.At >= n {
+func (p *playbackState) Restore(s Session) {
+	if s.Validate() != nil {
 		return
 	}
-	seen := make([]bool, n)
+	p.queue, p.order = s.Queue, s.Order
+	p.endRadio()
+	p.shuffle, p.repeat = s.Shuffle, s.Repeat%3
+	p.queueChanged()
+	p.loadSkipping(s.At, 0, stay, false, time.Duration(s.Position)*time.Millisecond)
+}
+
+// Version zero is the original MyGo session. All supported sessions restore
+// paused, including a crash during playback; Paused records the saved intent.
+func (s Session) Validate() error {
+	if s.Version < 0 || s.Version > 1 || s.Position < 0 || s.Position > int64((time.Duration(1<<63-1))/time.Millisecond) || s.Repeat < RepeatOff || s.Repeat > RepeatOne {
+		return errors.New("unsupported or invalid playback session")
+	}
+	if len(s.Queue) == 0 || len(s.Order) != len(s.Queue) || s.At < 0 || s.At >= len(s.Order) {
+		return errors.New("invalid playback queue")
+	}
+	seen := make([]bool, len(s.Queue))
 	for _, i := range s.Order {
-		if i < 0 || i >= n || seen[i] {
-			return
+		if i < 0 || i >= len(seen) || seen[i] {
+			return errors.New("invalid playback order")
 		}
 		seen[i] = true
 	}
-	p.queue, p.order = s.Queue, s.Order
-	p.shuffle, p.repeat = s.Shuffle, s.Repeat%3
-	p.loadSkipping(s.At, 0, stay, false, time.Duration(s.Position)*time.Millisecond)
+	return nil
+}
+
+// Only the built-in local source currently implements this extension. Existing
+// plugin Recorder.Played remains a start event; its protocol is unchanged.
+func (p *playbackState) recordCompletion() {
+	if p.native != nil && p.nativeState.Source.Frames >= 0 &&
+		p.nativeState.SourceStartFrame >= uint64(p.nativeState.Source.Frames) {
+		return
+	}
+	p.recordCompletionAt(p.Position())
+}
+
+func (p *playbackState) recordCompletionAt(position time.Duration) {
+	if p.track == nil {
+		return
+	}
+	if recorder, ok := p.sourceOf(p.track).(interface {
+		Completed(music.Track, time.Duration)
+	}); ok {
+		t := *cloneTrack(p.track)
+		work := func() { recorder.Completed(t, position) }
+		if p.complete != nil {
+			p.complete(work)
+		} else {
+			go work()
+		}
+	}
 }
 
 // Audio is the current track's sound, opened apart from what plays by OpenAudio:
@@ -949,7 +1259,7 @@ type Audio interface {
 // plays, as for transcribing an episode. It reads the same download, waiting for
 // what has not come in, and fails once the track changes, or for a track that
 // plays elsewhere. It works on any goroutine once opened; close it when done.
-func (p *Player) OpenAudio() (Audio, error) {
+func (p *playbackState) OpenAudio() (Audio, error) {
 	if p.stream == nil || p.track == nil {
 		return nil, errors.New("player: nothing loaded")
 	}

@@ -5,18 +5,13 @@ export default ({ command }: { command: string }) => ({
   name: "MyGo Music",
   identifier: "dev.egoist.music",
   slug: "mygo-music",
-  version: "0.1.25",
+  version: "26.11.18",
   out: "build",
+  resources: ["LICENSE"],
   urlSchemes: [command === "dev" ? "mygo-music-dev" : "mygo-music"],
-  updates: {
-    publicKey: "WzJsOGNIuf6mcEqo5ff8jub+NoQQOEk4JXreLPYjgyQ=",
-    github: "egoist/mygo-music",
-  },
   macos: {
     icon: "icon/AppIcon.icon",
     minimumSystemVersion: "13.0",
-    signingIdentity: "Developer ID Application: xinyu zeng (GJE9R5VE87)",
-    notarize: { keychainProfile: "notary" },
   },
   linux: {
     comment: "A music player for your files and more",

@@ -80,3 +80,20 @@ func TestCheckForUpdatesFromSettings(t *testing.T) {
 		t.Fatalf("checked %d times", checked)
 	}
 }
+
+// The tray offers a manual check only when the application updater is registered.
+func TestTrayChecksForUpdatesOnlyWithUpdater(t *testing.T) {
+	a := &app{}
+	for _, enabled := range []bool{false, true} {
+		a.updates = enabled
+		var found bool
+		for _, item := range a.trayMenu().Items() {
+			if item.Label == T("Check for Updates…") && item.Click != nil {
+				found = true
+			}
+		}
+		if found != enabled {
+			t.Fatalf("tray update action present = %t with updater registered = %t", found, enabled)
+		}
+	}
+}

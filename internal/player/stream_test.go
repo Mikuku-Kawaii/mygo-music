@@ -315,7 +315,7 @@ func TestFileStreamSeeks(t *testing.T) {
 		t.Fatal(err)
 	}
 	cache := NewCache(t.TempDir(), 1<<30)
-	p := &Player{Cache: cache}
+	p := &playbackState{Cache: cache}
 	src := fileSource{path: path}
 	info, s, err := p.open(src, music.Track{ID: "1", Source: "disk", Duration: int64(len(ref)/2) * 1000 / 44100}, "high", nil)
 	if err != nil {

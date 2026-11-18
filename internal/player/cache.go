@@ -20,7 +20,8 @@ import (
 // beside it in the same name's .json. Once they take more than the limit,
 // those played longest ago go first.
 type Cache struct {
-	dir string
+	dir           string
+	fallbackSongs string // optional read-only cache for native NetEase playback
 
 	mu    sync.Mutex
 	limit int64 // in bytes; 0 keeps nothing
@@ -28,7 +29,12 @@ type Cache struct {
 
 // NewCache returns a cache in dir of limit bytes.
 func NewCache(dir string, limit int64) *Cache {
-	return &Cache{dir: dir, limit: limit}
+	return NewCacheWithFallback(dir, limit, "")
+}
+
+// NewCacheWithFallback also reads complete NetEase FLACs from a previous cache.
+func NewCacheWithFallback(dir string, limit int64, fallbackSongs string) *Cache {
+	return &Cache{dir: dir, limit: limit, fallbackSongs: fallbackSongs}
 }
 
 // SetLimit changes how much the cache may take, and drops what is over.
@@ -147,9 +153,12 @@ func (c *Cache) part(st *music.Stream) *os.File {
 // is: kept, or still at part.
 func (c *Cache) keep(source, id, quality string, st *music.Stream, part string, n int64) (string, bool) {
 	c.mu.Lock()
-	limit := c.limit
-	c.mu.Unlock()
-	if n > limit/4 {
+	defer c.mu.Unlock()
+	return c.keepLocked(source, id, quality, st, part, n)
+}
+
+func (c *Cache) keepLocked(source, id, quality string, st *music.Stream, part string, n int64) (string, bool) {
+	if c.limit <= 0 || n > c.limit/4 {
 		return part, false
 	}
 	kept := *st
@@ -173,7 +182,7 @@ func (c *Cache) keep(source, id, quality string, st *music.Stream, part string, 
 		return part, false
 	}
 	os.WriteFile(filepath.Join(c.dir, key+".json"), meta, 0o600)
-	c.prune(path)
+	c.pruneLocked(path)
 	return path, true
 }
 
@@ -188,6 +197,8 @@ func (c *Cache) Size() int64 {
 
 // Clear drops every song kept.
 func (c *Cache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, f := range c.songs() {
 		c.remove(f.path)
 	}
@@ -216,9 +227,12 @@ func (c *Cache) songs() []cachedSong {
 	return out
 }
 
-func (c *Cache) remove(path string) {
-	os.Remove(path)
+func (c *Cache) remove(path string) bool {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return false
+	}
 	os.Remove(strings.TrimSuffix(path, filepath.Ext(path)) + ".json")
+	return true
 }
 
 // prune drops the songs played longest ago until the rest fit the limit,
@@ -226,6 +240,10 @@ func (c *Cache) remove(path string) {
 func (c *Cache) prune(keep string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.pruneLocked(keep)
+}
+
+func (c *Cache) pruneLocked(keep string) {
 	c.dropParts()
 	songs := c.songs()
 	slices.SortFunc(songs, func(a, b cachedSong) int { return a.used.Compare(b.used) })
@@ -237,8 +255,7 @@ func (c *Cache) prune(keep string) {
 		if total <= c.limit {
 			return
 		}
-		if f.path != keep {
-			c.remove(f.path)
+		if f.path != keep && c.remove(f.path) {
 			total -= f.size
 		}
 	}

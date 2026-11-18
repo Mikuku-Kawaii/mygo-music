@@ -55,3 +55,24 @@ func TestSpaceAfterOpeningNowPlaying(t *testing.T) {
 		t.Error("Space did not play again")
 	}
 }
+
+// Typing a space into search does not invoke the playback shortcut.
+func TestSpaceWhileTypingInSearchKeepsPlaying(t *testing.T) {
+	a := newTestApp()
+	a.pl.Cue([]music.Track{song("7", "Song", "Artist")})
+	out := audio.NewPlayer(&silence{})
+	out.SetVolume(0)
+	out.Play()
+	a.pl.Attach(out)
+	defer out.Close()
+
+	tt := ui.NewTester(a.view, 880, 600)
+	tt.Key(ui.Cmd, ui.KeyF)
+	tt.Type("two")
+	tt.TypeKey(0, ui.KeySpace, " ")
+	tt.Type("words")
+	tt.Frame()
+	if a.query != "two words" || !a.pl.Playing() {
+		t.Fatalf("search captured %q, playing=%v", a.query, a.pl.Playing())
+	}
+}

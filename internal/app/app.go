@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/debug"
 	"slices"
 	"sync/atomic"
 
@@ -34,7 +33,14 @@ const (
 	pageSavedAlbums
 	pageBrowse
 	pageSection
+	pageDownloads
+	pageDownloadQueue
+	pageDownloadCompleted
 )
+
+func (p pageKind) inDownloads() bool {
+	return p == pageDownloads || p == pageDownloadQueue || p == pageDownloadCompleted
+}
 
 type route struct {
 	page pageKind
@@ -74,6 +80,7 @@ type app struct {
 
 	captions  captionState    // the episode playing's captions, and the model they take
 	installer pluginInstaller // installing and updating plugins
+	downloads *downloadWorkspace
 	// links are the app's links opened before its window was made, macOS
 	// handing over the one it was started with first.
 	links []string
@@ -117,6 +124,7 @@ type app struct {
 	settingsQuery     string // what's searched for in the settings
 	settingsSearchBox ui.Handle
 	settingsUnderTop  bool // the settings' page has scrolled under its top edge
+	audioSettings     audioSettingsState
 
 	suggestions suggestState // what the search field's query may be after
 
@@ -201,6 +209,11 @@ func (a *app) redraw() {
 	}
 }
 
+func (a *app) updatePlaybackVisibility() {
+	visible := func(w *mygo.Window) bool { return w != nil && w.IsVisible() && !w.IsMinimized() }
+	a.pl.SetVisualizationVisible(!a.quitting && (visible(a.win) || a.settingsPage == "audio" && visible(a.settingsWin)))
+}
+
 // shotHook, when set, drives the app to check its design.
 var shotHook func(a *app)
 
@@ -243,12 +256,13 @@ func (a *app) makeSources() {
 			a.allLibs = append(a.allLibs, lib)
 		}
 	}
+	a.addBundledDownloads()
 	a.enabledChanged()
 	a.library = a.libs[0]
 	if lib := a.libOf(a.settings.Source); lib != nil {
 		a.library = lib
 	}
-	a.route = route{page: pageHome, src: a.library.id}
+	a.route = route{page: a.library.landingPage(), src: a.library.id}
 	a.local.OnChange(func() {
 		a.post(func() { a.libraryChanged(builtIn) })
 	})
@@ -275,6 +289,10 @@ func (a *app) enabledChanged() {
 		}
 		a.headers.set(on)
 	}
+	if a.pl != nil {
+		a.pl.RefreshConfiguration()
+	}
+	a.refreshDownloadSources()
 }
 
 // setPluginEnabled turns a plugin on or off. Off, it stops, its pages go, and if
@@ -321,6 +339,8 @@ func (a *app) closeSources() {
 
 // Run runs the app until it quits.
 func Run() error {
+	// Match the installed app's data and cache directories in plain builds too.
+	mygo.App.SetName("MyGo Music")
 	// Opening the app again shows the running one's window: Linux and
 	// Windows would start another, with a second tray icon. Asked before
 	// anything else, so the second one touches no data on its way out.
@@ -333,8 +353,9 @@ func Run() error {
 		lyricAt:     -1,
 		queueAt:     -1,
 		cacheUsed:   -1,
+		downloads:   &downloadWorkspace{},
 	}
-	a.useUpdater(i18n.Resolve(loadSettings().Language, systemLanguages()))
+	// Application updates for this build are installed manually.
 	mygo.App.WhenReady(func() {
 		a.settings = loadSettings()
 		a.settings.applyAppearance()
@@ -348,6 +369,7 @@ func Run() error {
 		// made, and the view asks the player what plays.
 		a.art = newArtCache(a.post)
 		a.pl = player.New(a.post)
+		a.pl.BindSystemMedia()
 		a.pl.Quiet = func(fn func()) { mygo.RunOnMain(fn) }
 		a.pl.Source = a.sourceByID
 		a.pl.Failed = a.sourceFailed
@@ -357,9 +379,9 @@ func Run() error {
 		a.pl.Changed = func() {
 			a.keepSession()
 			a.syncCaptions()
+			a.finishDSPApply()
 		}
 		a.volume = a.settings.Volume
-		a.pl.SetVolume(a.volume)
 		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:         mygo.App.Name(),
 			Width:         1180,
@@ -377,8 +399,13 @@ func Run() error {
 			BackgroundColor:      "light-dark(#ffffff, #141416)",
 			Content:              ui.View(a.view),
 		})
+		a.pl.SetVolume(a.volume)
+		if err := a.pl.SetOutput(a.settings.AudioOutput); err != nil {
+			a.audioSettings.err = err.Error()
+		}
 		a.setMenu()
 		a.boot()
+		a.initDownloads()
 		// The notch player is macOS's, over its menu bar: elsewhere it would
 		// hang at the top of the screen as a black box.
 		if runtime.GOOS == "darwin" {
@@ -387,12 +414,17 @@ func Run() error {
 		// From the menu bar alone, the Dock icon shows while the window
 		// does.
 		a.syncDock()
-		a.win.OnShow(a.syncDock)
-		a.win.OnHide(a.syncDock)
-		// Hidden, it draws nothing for a while: what the heap took for
-		// the pages it showed goes back to the system, which Go would
-		// keep for minutes.
-		a.win.OnHide(func() { go debug.FreeOSMemory() })
+		a.updatePlaybackVisibility()
+		a.win.OnShow(func() {
+			a.syncDock()
+			a.updatePlaybackVisibility()
+		})
+		a.win.OnHide(func() {
+			a.syncDock()
+			a.updatePlaybackVisibility()
+		})
+		a.win.OnMinimize(a.updatePlaybackVisibility)
+		a.win.OnRestore(a.updatePlaybackVisibility)
 		// Shown or switched to a while after, it shows what's new.
 		a.win.OnFocus(a.freshenHome)
 		a.applyTray()
@@ -427,6 +459,11 @@ func Run() error {
 	// Windows leaves an icon in the notification area after its app until
 	// the pointer passes over it.
 	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
+		a.cancelLoudness()
+		a.stopDownloads()
+		if a.pl != nil {
+			a.pl.Close()
+		}
 		if a.tray != nil {
 			a.tray.Destroy()
 		}

@@ -13,7 +13,7 @@ import (
 )
 
 func TestPlayEmptyQueue(t *testing.T) {
-	p := &Player{at: -1}
+	p := &playbackState{at: -1}
 	p.PlayQueue(nil, 0) // an empty playlist's play button
 	if p.Current() != nil {
 		t.Error("playing from an empty queue")
@@ -31,9 +31,9 @@ func (silence) Read(b []float32) (int, error) { clear(b); return len(b), nil }
 
 // posted collects what the player posts to the main thread, for the test
 // to run there.
-func posted() (chan func(), *Player) {
+func posted() (chan func(), *playbackState) {
 	ch := make(chan func(), 16)
-	p := New(func(fn func()) { ch <- fn })
+	p := newPlaybackState(func(fn func()) { ch <- fn })
 	p.Cue([]music.Track{{ID: "1", Name: "one", Duration: 600000}})
 	out := audio.NewPlayer(silence{})
 	out.SetVolume(0)
@@ -122,7 +122,7 @@ func TestSeekTwicePlaysOn(t *testing.T) {
 // A radio asks for more as its queue nears its end, and adds what is not
 // in it already.
 func TestRadioRefills(t *testing.T) {
-	p := &Player{at: -1}
+	p := &playbackState{at: -1}
 	p.Cue([]music.Track{{ID: "1"}, {ID: "2"}})
 	asked := 0
 	p.AttachRadio("station", func(got func([]music.Track)) {
@@ -209,7 +209,7 @@ func TestCache(t *testing.T) {
 // Leaving a radio keeps the song playing and those before it, drops those
 // it queued after, and asks it for no more.
 func TestEndRadio(t *testing.T) {
-	p := &Player{at: -1}
+	p := &playbackState{at: -1}
 	p.Cue([]music.Track{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4"}})
 	p.at, p.track = 1, &p.queue[1]
 	asked := 0
@@ -239,13 +239,14 @@ func (s picky) Stream(id, _ string) (*music.Stream, error) {
 		return nil, music.ErrUnavailable
 	}
 	path, err := filepath.Abs("testdata/seek.mp3")
-	return &music.Stream{URL: "file://" + filepath.ToSlash(path), Type: "mp3"}, err
+	// A drive letter must be in the URL path, not its host (file://D:/...).
+	return &music.Stream{URL: music.FileURL(path), Type: "mp3"}, err
 }
 
 // pickyQueue is a, b and c, of which b can't play.
-func pickyQueue() (*Player, chan func(), []music.Track) {
+func pickyQueue() (*playbackState, chan func(), []music.Track) {
 	ch := make(chan func(), 64)
-	p := New(func(fn func()) { ch <- fn })
+	p := newPlaybackState(func(fn func()) { ch <- fn })
 	p.SetVolume(0)
 	src := picky{ok: map[string]bool{"a": true, "c": true}}
 	p.Source = func(string) music.Source { return src }
@@ -253,7 +254,7 @@ func pickyQueue() (*Player, chan func(), []music.Track) {
 }
 
 // settle runs what the player posts until it loaded what it went on to.
-func settle(t *testing.T, ch chan func(), p *Player) {
+func settle(t *testing.T, ch chan func(), p *playbackState) {
 	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for p.Loading() {
@@ -308,7 +309,7 @@ func TestPrevSkipsBack(t *testing.T) {
 // Shuffling a whole list may start on any song, not always its first; a
 // song picked to start stays first.
 func TestShuffleOrderHead(t *testing.T) {
-	p := &Player{order: make([]int, 10)}
+	p := &playbackState{order: make([]int, 10)}
 	heads := map[int]bool{}
 	for range 200 {
 		for i := range p.order {

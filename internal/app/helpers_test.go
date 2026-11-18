@@ -20,6 +20,13 @@ import (
 // serving: a test runs on another.
 var mainThread = make(chan func())
 
+// UI fixtures intentionally leave source preparation pending. Previously this
+// happened accidentally because the player posted completion to a discarded UI
+// callback. The real controller now progresses independently, so the fixture
+// expresses that boundary directly and releases it when the suite shuts down.
+var fixturePlaybackStop = make(chan struct{})
+var fixturePlayers []*player.Player
+
 // onMainThread runs fn on the main thread. Without a window nothing else serves
 // it, and what MyGo does there, as changing the theme, would wait forever.
 func onMainThread(fn func()) {
@@ -40,7 +47,14 @@ func TestMain(m *testing.M) {
 	}
 	mygo.App.SetPath(mygo.PathUserData, dir)
 	result := make(chan int)
-	go func() { result <- m.Run() }()
+	go func() {
+		code := m.Run()
+		for _, p := range fixturePlayers {
+			p.Close()
+		}
+		close(fixturePlaybackStop)
+		result <- code
+	}()
 	code := 0
 	for running := true; running; {
 		select {
@@ -364,12 +378,22 @@ func addFake(a *app, src music.Source) *library {
 
 // newTestApp is an app with one source, a fakeSource called "fake": see fake.
 func newTestApp() *app {
-	a := &app{signInOver: new(atomic.Pointer[mygo.Window]), settings: defaultSettings(), settingText: map[string]*string{}, lyricAt: -1, queueAt: -1}
+	a := &app{signInOver: new(atomic.Pointer[mygo.Window]), settings: defaultSettings(), settingText: map[string]*string{}, lyricAt: -1, queueAt: -1, downloads: &downloadWorkspace{}}
 	a.library = addFake(a, newFakeSource("fake"))
+	fake(a).stream = func(string, string) (*music.Stream, error) {
+		<-fixturePlaybackStop
+		return nil, music.ErrUnavailable
+	}
 	a.route = route{page: pageHome, src: "fake"}
 	a.art = newArtCache(func(func()) {})
-	a.pl = player.New(func(func()) {})
-	a.pl.Source = a.sourceByID
+	a.pl = player.New(a.post)
+	fixturePlayers = append(fixturePlayers, a.pl)
+	a.pl.Source = func(id string) music.Source {
+		if id == "" {
+			return a.library.src
+		} // unsourced view fixtures
+		return a.sourceByID(id)
+	}
 	a.pl.SetVolume(0.5)
 	return a
 }

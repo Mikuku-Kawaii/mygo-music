@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"mygo-music/internal/i18n"
 	"mygo-music/internal/music"
@@ -608,10 +609,41 @@ func (s *Source) RemoteUse(deviceID string) error          { return music.ErrUns
 // library is what library.json keeps: the IDs of tracks that may be away for
 // now, and back when their folder is.
 type library struct {
-	Folders   []string   `json:"folders,omitempty"`
-	Likes     []string   `json:"likes,omitempty"` // newest first
-	Playlists []playlist `json:"playlists,omitempty"`
-	Recent    []string   `json:"recent,omitempty"` // last played first
+	Completed []Completion `json:"completed,omitempty"`
+	Folders   []string     `json:"folders,omitempty"`
+	Likes     []string     `json:"likes,omitempty"` // newest first
+	Playlists []playlist   `json:"playlists,omitempty"`
+	Recent    []string     `json:"recent,omitempty"` // last played first
+}
+
+type Completion struct {
+	ID       string    `json:"id"`
+	Position int64     `json:"position"`
+	At       time.Time `json:"at"`
+}
+
+// Completed is separate from Played/Recent. Only a confirmed presentation end
+// records completion; manually changing tracks never calls this method.
+func (s *Source) Completed(track music.Track, position time.Duration) {
+	if track.ID == "" {
+		return
+	}
+	err := s.change(func() error {
+		s.lib.Completed = slices.Insert(s.lib.Completed, 0, Completion{track.ID, position.Milliseconds(), time.Now()})
+		if len(s.lib.Completed) > keepRecent {
+			s.lib.Completed = s.lib.Completed[:keepRecent]
+		}
+		return nil
+	}, false)
+	if err != nil {
+		log.Printf("local: saving completion: %v", err)
+	}
+}
+
+func (s *Source) Completions() []Completion {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clone(s.lib.Completed)
 }
 
 type playlist struct {

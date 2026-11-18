@@ -1,0 +1,9 @@
+{
+  "id": "media-downloads",
+  "name": "Search and Downloads",
+  "version": "0.0.1",
+  "minAppVersion": "26.11.18",
+  "main": "index.js",
+  "playback": "stream",
+  "workspace": "downloads"
+}

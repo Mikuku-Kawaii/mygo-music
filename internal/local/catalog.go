@@ -10,15 +10,17 @@ import (
 	"strconv"
 	"strings"
 
+	"mygo-music/internal/audioengine/dsp"
 	"mygo-music/internal/i18n"
 	"mygo-music/internal/music"
 )
 
 // entry is what's known of a file, as index.json keeps it.
 type entry struct {
-	Path string `json:"path"`
-	Size int64  `json:"size"`
-	Mod  int64  `json:"mod"` // in nanoseconds since 1970
+	Audio music.AudioProperties `json:"audio,omitzero"`
+	Path  string                `json:"path"`
+	Size  int64                 `json:"size"`
+	Mod   int64                 `json:"mod"` // in nanoseconds since 1970
 
 	Title       string `json:"title"`
 	Artist      string `json:"artist,omitempty"` // as the tag has it
@@ -32,8 +34,9 @@ type entry struct {
 	Cover   string `json:"cover,omitempty"`   // the picture inside, once kept
 	Sidecar string `json:"sidecar,omitempty"` // the picture beside it
 
-	Gain float64 `json:"gain,omitempty"`
-	Peak float64 `json:"peak,omitempty"`
+	Gain       float64   `json:"gain,omitempty"`
+	Peak       float64   `json:"peak,omitempty"`
+	ReplayGain dsp.Gains `json:"replayGain,omitzero"`
 }
 
 func (e *entry) image() string { return cmp.Or(e.Cover, e.Sidecar) }
@@ -267,7 +270,7 @@ func (al *album) public() music.Album {
 // public is the track as it's answered. Its picture is the album's if it has
 // none of its own, and it has one without an album too.
 func (it *item) public() music.Track {
-	t := music.Track{ID: it.id, Source: ID, Name: it.Title, Artists: it.artists, Duration: it.Duration}
+	t := music.Track{ID: it.id, Source: ID, Name: it.Title, Artists: it.artists, Duration: it.Duration, Audio: it.Audio}
 	if it.album != nil {
 		t.Album = it.album.public()
 	}

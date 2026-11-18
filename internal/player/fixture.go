@@ -13,7 +13,10 @@ import (
 // anything, for the tests of the views that show it.
 
 // Cue makes tracks the queue, in order, with the first current.
-func (p *Player) Cue(tracks []music.Track) {
+func (p *playbackState) Cue(tracks []music.Track) {
+	if len(tracks) == 0 {
+		return
+	}
 	p.queue = tracks
 	p.order = make([]int, len(tracks))
 	for i := range p.order {
@@ -21,25 +24,26 @@ func (p *Player) Cue(tracks []music.Track) {
 	}
 	p.at = 0
 	p.track = &p.queue[0]
+	p.queueChanged()
 }
 
 // SetLyrics gives the current track lines, as loaded.
-func (p *Player) SetLyrics(lines []lyrics.Line) {
+func (p *playbackState) SetLyrics(lines []lyrics.Line) {
 	p.lyrics, p.lyricsLoaded = lines, true
 }
 
 // Hold makes the player play at pos with nothing to play: its position
 // stays there.
-func (p *Player) Hold(pos time.Duration) {
+func (p *playbackState) Hold(pos time.Duration) {
 	p.pending = pos
 	p.playing = true
 }
 
 // Attach makes out the current track's audio, playing.
-func (p *Player) Attach(out *audio.Player) {
+func (p *playbackState) Attach(out *audio.Player) {
 	p.out = out
 	p.playing = true
 }
 
 // SetStream makes st what the current track streams.
-func (p *Player) SetStream(st *music.Stream) { p.info = st }
+func (p *playbackState) SetStream(st *music.Stream) { p.info = st }

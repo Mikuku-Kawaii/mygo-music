@@ -54,19 +54,32 @@ type remote struct {
 // commands runs a source's commands in the order they were given, off the main
 // thread, for a pause and a play not to pass each other on the way to a plugin.
 type commands struct {
-	mu   sync.Mutex
-	list []func()
-	busy bool
+	mu     sync.Mutex
+	list   []func()
+	busy   bool
+	closed bool
 }
 
 func (c *commands) add(fn func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
 	c.list = append(c.list, fn)
 	if !c.busy {
 		c.busy = true
 		go c.run()
 	}
+}
+
+// close drops commands not yet sent. A context-free plugin call already in
+// flight cannot be interrupted; its result is rejected by the controller.
+func (c *commands) close() {
+	c.mu.Lock()
+	c.closed = true
+	c.list = nil
+	c.mu.Unlock()
 }
 
 func (c *commands) run() {
@@ -85,7 +98,7 @@ func (c *commands) run() {
 }
 
 // command gives a source a command; if it fails, the bar says so.
-func (p *Player) command(src music.Source, fn func() error) {
+func (p *playbackState) command(src music.Source, fn func() error) {
 	gen := p.gen
 	p.cmds.add(func() {
 		if err := fn(); err != nil {
@@ -99,7 +112,7 @@ func (p *Player) command(src music.Source, fn func() error) {
 }
 
 // remoteFailed says why a remote source didn't do what it was told.
-func (p *Player) remoteFailed(src music.Source, err error) {
+func (p *playbackState) remoteFailed(src music.Source, err error) {
 	p.err = errorText(err)
 	if errors.Is(err, music.ErrSignIn) || errors.Is(err, music.ErrSetup) {
 		p.playing = false
@@ -115,7 +128,7 @@ func (p *Player) remoteFailed(src music.Source, err error) {
 
 // loadRemote tells src to play the track at order[at], if play, or else just
 // keeps it, to tell once asked: a session picked up shouldn't start anything.
-func (p *Player) loadRemote(gen int, src music.Source, at, skipped, dir int, play bool, from time.Duration) {
+func (p *playbackState) loadRemote(gen int, src music.Source, at, skipped, dir int, play bool, from time.Duration) {
 	r := &remote{src: src}
 	p.remote = r
 	if !play {
@@ -155,7 +168,7 @@ func (p *Player) loadRemote(gen int, src music.Source, at, skipped, dir int, pla
 // remoteQueue returns the IDs of the queue's tracks of source, in play order,
 // and where among them order[at] is: the source goes on through them itself,
 // as it would with the app closed.
-func (p *Player) remoteQueue(source string, at int) ([]string, int) {
+func (p *playbackState) remoteQueue(source string, at int) ([]string, int) {
 	var ids []string
 	start := 0
 	for k, i := range p.order {
@@ -170,7 +183,7 @@ func (p *Player) remoteQueue(source string, at int) ([]string, int) {
 }
 
 // remotePosition is where the track is by the last answer and the clock.
-func (p *Player) remotePosition() time.Duration {
+func (p *playbackState) remotePosition() time.Duration {
 	r := p.remote
 	pos := r.pos
 	if r.running {
@@ -185,7 +198,7 @@ func (p *Player) remotePosition() time.Duration {
 }
 
 // remoteToggle pauses or plays on.
-func (p *Player) remoteToggle() {
+func (p *playbackState) remoteToggle() {
 	r := p.remote
 	if p.playing {
 		r.pos, r.running = p.remotePosition(), false
@@ -203,7 +216,7 @@ func (p *Player) remoteToggle() {
 }
 
 // remoteSeek moves the track, showing it there at once.
-func (p *Player) remoteSeek(t time.Duration) {
+func (p *playbackState) remoteSeek(t time.Duration) {
 	r := p.remote
 	r.pos, r.at, r.command = t, p.now(), p.now()
 	r.near = false
@@ -215,7 +228,7 @@ func (p *Player) remoteSeek(t time.Duration) {
 
 // remoteVolume sets the source's volume, only the last of those asked while
 // the one before is on its way: a slider asks for many.
-func (p *Player) remoteVolume(v float64) {
+func (p *playbackState) remoteVolume(v float64) {
 	r := p.remote
 	if !r.started {
 		return
@@ -239,7 +252,7 @@ func (p *Player) remoteVolume(v float64) {
 
 // remotePoll asks the source how it's going in a moment, unless it's asked
 // already. Nothing is asked unless the listener wants it to play.
-func (p *Player) remotePoll(r *remote) {
+func (p *playbackState) remotePoll(r *remote) {
 	if r.polling || !p.playing || p.remote != r {
 		return
 	}
@@ -261,14 +274,14 @@ func (p *Player) remotePoll(r *remote) {
 
 // remoteAnswered takes how the source says it's going, and redraws only if
 // that changed what shows.
-func (p *Player) remoteAnswered(r *remote, st *music.RemoteState, err error) {
+func (p *playbackState) remoteAnswered(r *remote, st *music.RemoteState, err error) {
 	if err != nil {
 		r.fails++
 		if errors.Is(err, music.ErrSignIn) || errors.Is(err, music.ErrSetup) || r.fails >= remoteFailures {
 			p.playing, r.running = false, false
 			r.pos, r.at = p.remotePositionStopped(r), p.now()
 			p.remoteFailed(r.src, err)
-			p.post(func() {})
+			p.redraw()
 			return
 		}
 		p.remotePoll(r)
@@ -312,7 +325,7 @@ func (p *Player) remoteAnswered(r *remote, st *music.RemoteState, err error) {
 		r.pos, r.at, r.running = pos, p.now(), false
 		p.playing = false
 		p.sync()
-		p.post(func() {})
+		p.redraw()
 	default:
 		p.remoteGoes(r, st, settling)
 		p.remotePoll(r)
@@ -320,14 +333,14 @@ func (p *Player) remoteAnswered(r *remote, st *music.RemoteState, err error) {
 }
 
 // remotePositionStopped is where the track is as the clock stops.
-func (p *Player) remotePositionStopped(r *remote) time.Duration {
+func (p *playbackState) remotePositionStopped(r *remote) time.Duration {
 	r.running = true
 	defer func() { r.running = false }()
 	return p.remotePosition()
 }
 
 // remoteGoes takes the position of the track playing, as it's meant to.
-func (p *Player) remoteGoes(r *remote, st *music.RemoteState, settling bool) {
+func (p *playbackState) remoteGoes(r *remote, st *music.RemoteState, settling bool) {
 	r.seen = true
 	if settling {
 		return
@@ -350,13 +363,13 @@ func (p *Player) remoteGoes(r *remote, st *music.RemoteState, settling bool) {
 	}
 	if shown {
 		p.sync()
-		p.post(func() {})
+		p.redraw()
 	}
 }
 
 // remoteEnded goes on from the track the source finished, by the queue's order
 // and the listener's repeat.
-func (p *Player) remoteEnded(r *remote) {
+func (p *playbackState) remoteEnded(r *remote) {
 	switch {
 	case p.repeat == RepeatOne:
 		p.load(p.at)
@@ -372,14 +385,14 @@ func (p *Player) remoteEnded(r *remote) {
 		r.pos, r.at, r.near = 0, p.now(), false
 		p.sync()
 	}
-	p.post(func() {})
+	p.redraw()
 }
 
 // remoteMoved follows the source to the track it went on to, by itself or told
 // to at the other end. Repeating one, it goes back. One the queue doesn't have
 // isn't the app's to show: it stops following.
-func (p *Player) remoteMoved(r *remote, st *music.RemoteState) {
-	defer p.post(func() {})
+func (p *playbackState) remoteMoved(r *remote, st *music.RemoteState) {
+	defer p.redraw()
 	if p.repeat == RepeatOne {
 		p.load(p.at)
 		return
@@ -397,7 +410,7 @@ func (p *Player) remoteMoved(r *remote, st *music.RemoteState) {
 }
 
 // follow makes order[at] the current track, which the source already plays.
-func (p *Player) follow(r *remote, at int, st *music.RemoteState) {
+func (p *playbackState) follow(r *remote, at int, st *music.RemoteState) {
 	p.gen++
 	gen := p.gen
 	p.at = at

@@ -14,6 +14,7 @@ import (
 	"mygo-music/internal/i18n"
 	"mygo-music/internal/local"
 	"mygo-music/internal/music"
+	"mygo-music/internal/player"
 	"mygo-music/internal/plugin"
 )
 
@@ -25,6 +26,7 @@ func (a *app) openSettings() {
 	if a.settingsWin != nil {
 		a.settingsWin.Show()
 		a.settingsWin.Focus()
+		a.updatePlaybackVisibility()
 		a.measureCache()
 		return
 	}
@@ -49,8 +51,12 @@ func (a *app) openSettings() {
 		BackgroundColor: "light-dark(#f4f4f6, #1c1c1f)",
 		Content:         ui.View(a.settingsView),
 	})
+	a.settingsWin.OnShow(a.updatePlaybackVisibility)
+	a.settingsWin.OnHide(a.updatePlaybackVisibility)
 	a.settingsWin.OnClosed(func() {
 		a.settingsWin = nil
+		a.cancelLoudness()
+		a.updatePlaybackVisibility()
 		// Its sign-in dialog goes with it; a sign-in on its way still counts.
 		if a.signIn.here {
 			a.signIn.open = false
@@ -58,6 +64,7 @@ func (a *app) openSettings() {
 		a.syncDock()
 	})
 	a.syncDock()
+	a.updatePlaybackVisibility()
 }
 
 // openSourceSettings shows the page of the settings where plugins are set up.
@@ -161,13 +168,14 @@ func (a *app) settingsView(c *ui.Context) {
 		}
 	}
 	query := strings.ToLower(strings.TrimSpace(a.settingsQuery))
+	headerHeight := topBar(c)
 
 	ui.Row(c).Fill().AlignItems(ui.Stretch).Children(func() {
 		// Under the window buttons where they sit over the sidebar. Where nothing
 		// takes the press, it moves the window, as the title bar it reaches into would.
 		top := float32(14)
 		if c.TitleBar().Left > 0 {
-			top = topBar(c) + 4
+			top = headerHeight + 4
 		}
 		ui.Column(c).Width(settingsSidebarWidth).Shrink(0).Padding(top, 12, 14, 12).Gap(2).Background(p.sidebar).DragWindow().Children(func() {
 			a.settingsSearch(c, p)
@@ -178,9 +186,10 @@ func (a *app) settingsView(c *ui.Context) {
 		ui.Box(c).Width(1).Shrink(0).Background(p.hairline)
 		// The page's title is in the header, the strip the window buttons leave. What
 		// scrolls goes under a hard edge there, showing only once there's something under it.
-		pad := max(24, topBar(c)+6)
+		pad := max(24, headerHeight+6)
 		ui.Box(c).Grow(1).MinWidth(0).Children(func() {
-			ui.Scroll(c.Key(current.id+"\x00"+query)).Fill().Padding(pad, 28, 32, 28).Gap(8).Children(func() {
+			ui.Scroll(c.Key(current.id+"\x00"+query)).Fill().Padding(pad, 28, 32, 28).
+				ScrollbarInsets(headerHeight, 0, 0, 0).Gap(8).Children(func() {
 				mark := ui.Box(c.Key("start-mark")).Height(0).Bounds()
 				if mark.W > 0 {
 					a.settingsUnderTop = mark.Y < pad-0.5
@@ -200,7 +209,7 @@ func (a *app) settingsView(c *ui.Context) {
 					ui.Text(c, T("No settings found")).FontSize(13.5).TextColor(p.muted).Margin(8, 4, 0, 4)
 				}
 			})
-			edge := ui.Box(c.Key("top-edge")).Absolute().Top(0).Left(0).Right(0).Height(topBar(c)).DragWindow().
+			edge := ui.Box(c.Key("top-edge")).Absolute().Top(0).Left(0).Right(0).Height(headerHeight).DragWindow().
 				Material(glass.ScrollEdge{Hard: true, Background: p.bg})
 			title := current.title
 			if query != "" {
@@ -209,7 +218,7 @@ func (a *app) settingsView(c *ui.Context) {
 			// The + keeps clear of the window buttons where they sit at the
 			// right (Linux, Windows).
 			right := max(32, c.TitleBar().Right+12)
-			header := ui.Row(c.Key("header")).Absolute().Top(0).Left(0).Right(0).Height(topBar(c)).Padding(0, right, 0, 32).AlignItems(ui.Center).DragWindow()
+			header := ui.Row(c.Key("header")).Absolute().Top(0).Left(0).Right(0).Height(headerHeight).Padding(0, right, 0, 32).AlignItems(ui.Center).DragWindow()
 			header.Children(func() {
 				ui.Text(c, title).FontSize(15).FontWeight(700).SingleLine().Shrink(1).MinWidth(0)
 				if query == "" && current.id == "plugins" {
@@ -265,6 +274,10 @@ func (a *app) settingsNavItem(c *ui.Context, p palette, sec settingsSection, sel
 	})
 	if b.Clicked() {
 		a.settingsPage, a.settingsQuery = sec.id, ""
+		a.updatePlaybackVisibility()
+		if sec.id == "audio" {
+			a.refreshAudioDevices()
+		}
 	}
 }
 
@@ -425,6 +438,7 @@ func (a *app) settingsSections(c *ui.Context, p palette) []settingsSection {
 			}
 			if i, ok := choice(c, "quality", T("Quality"), labels, at); ok {
 				s.Quality = qualityLevels[i].level
+				a.pl.RefreshConfiguration()
 				a.changed()
 			}
 		})
@@ -436,12 +450,14 @@ func (a *app) settingsSections(c *ui.Context, p palette) []settingsSection {
 			})
 		}
 		row(T("Even Out Loudness"), T("Adjust each song's volume by what its plugin measured of it, for them to sound as loud as each other"), func() {
-			if ui.Switch(c.Key("normalize"), &s.Normalize).Label(T("Even Out Loudness")).Changed() {
+			if ui.Switch(c.Key("normalize"), &s.Normalize).Disabled(a.pl.AudioOutput().Requested.Mode != player.OutputCompatible).Label(T("Even Out Loudness")).Changed() {
 				a.pl.SetVolume(a.volume)
 				a.changed()
 			}
 		})
 	})
+
+	add("audio", T("Audio Output"), iconPlug, func(row settingsRow, block settingsBlock) { a.audioSettingsSection(c, p, row, block) })
 
 	add("cache", T("Cache"), iconDatabase, func(row settingsRow, block settingsBlock) {
 		row(T("Song Cache"), Tf("Songs from elsewhere are kept here to play again at once, without the network. %s", a.cacheUsage()), func() {
