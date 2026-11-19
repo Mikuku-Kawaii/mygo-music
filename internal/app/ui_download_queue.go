@@ -49,7 +49,7 @@ func (a *app) downloadQueuePage(c *ui.Context, completed bool) {
 		}
 		if !completed && a.pl != nil && a.pl.DownloadPriorityBusy() &&
 			slices.ContainsFunc(tasks, func(t downloads.Task) bool { return t.State == downloads.Active || t.State == downloads.Queued }) {
-			ui.Text(c, T("Downloads resume when playback and prefetch are idle.")).FontSize(12.5).TextColor(p.muted).MaxLines(2)
+			ui.Text(c, T("Downloads resume after audio loading or prefetching finishes.")).FontSize(12.5).TextColor(p.muted).MaxLines(2)
 		}
 		ui.List(c.Key(a.route), &a.trackList, len(tasks)).Grow(1).MinHeight(0).
 			ItemKey(func(i int) any { return tasks[i].ID }).Rows(func(row ui.ListRow) {

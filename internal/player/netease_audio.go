@@ -19,12 +19,12 @@ const neteaseSource = "netease"
 
 // Keep the file open until the Windows transport closes. This protects its
 // name from cache eviction while the native decoder may reopen it for a seek.
-type neteaseFLAC struct {
+type neteaseFile struct {
 	*os.File
 	temporary bool
 }
 
-func (f *neteaseFLAC) release() {
+func (f *neteaseFile) release() {
 	if f == nil {
 		return
 	}
@@ -38,7 +38,28 @@ func isLosslessFLAC(st *music.Stream) bool {
 	return st != nil && st.Quality == "lossless" && strings.EqualFold(st.Type, "flac")
 }
 
-func (c *Cache) neteaseCachedFLAC(ctx context.Context, id string) (*neteaseFLAC, *music.Stream) {
+func neteaseStreamType(st *music.Stream, quality string) string {
+	if st == nil || quality == "lossless" && !isLosslessFLAC(st) {
+		return ""
+	}
+	typ := strings.ToLower(st.Type)
+	switch typ {
+	case "flac", "mp3", "ogg", "m4a", "mp4", "aac":
+		return typ
+	}
+	return ""
+}
+
+func neteaseStreamInfo(st *music.Stream, typ, requested string, size int64) *music.Stream {
+	info := *st
+	info.URL, info.Headers, info.Type, info.Size = "", nil, typ, size
+	if !isLosslessFLAC(st) && info.Quality != "high" && info.Quality != "standard" {
+		info.Quality = requested
+	}
+	return &info
+}
+
+func (c *Cache) neteaseCachedAudio(ctx context.Context, id, quality string, stereo bool) (*neteaseFile, *music.Stream) {
 	if c == nil {
 		return nil, nil
 	}
@@ -48,12 +69,13 @@ func (c *Cache) neteaseCachedFLAC(ctx context.Context, id string) (*neteaseFLAC,
 			continue
 		}
 		cache.mu.Lock()
-		f, st, ok := cache.find(neteaseSource, id, "lossless")
+		f, st, ok := cache.find(neteaseSource, id, quality)
 		cache.mu.Unlock()
 		if !ok {
 			continue
 		}
-		if !isLosslessFLAC(st) || validateNeteaseFLAC(ctx, f.Name(), false) != nil {
+		typ := neteaseStreamType(st, quality)
+		if typ == "" || validateNeteaseAudio(ctx, f.Name(), typ, stereo, false) != nil {
 			f.Close()
 			continue
 		}
@@ -61,8 +83,7 @@ func (c *Cache) neteaseCachedFLAC(ctx context.Context, id string) (*neteaseFLAC,
 			now := time.Now()
 			os.Chtimes(f.Name(), now, now)
 		}
-		st.URL, st.Headers = "", nil
-		return &neteaseFLAC{File: f}, st
+		return &neteaseFile{File: f}, neteaseStreamInfo(st, typ, quality, st.Size)
 	}
 	return nil, nil
 }
@@ -70,28 +91,49 @@ func (c *Cache) neteaseCachedFLAC(ctx context.Context, id string) (*neteaseFLAC,
 // OpenNetEaseDownloadCache hands the downloads workspace a read lease on an
 // existing FLAC. It never starts or joins a playback load.
 func (c *Cache) OpenNetEaseDownloadCache(ctx context.Context, id string) (*os.File, *music.Stream) {
-	if f, st := c.neteaseCachedFLAC(ctx, id); f != nil {
+	if f, st := c.neteaseCachedAudio(ctx, id, "lossless", false); f != nil {
 		return f.File, st
 	}
 	return nil, nil
 }
 
-func (c *Cache) openNeteaseFLAC(ctx context.Context, src music.Source, id string) (*neteaseFLAC, *music.Stream, error) {
-	if f, st := c.neteaseCachedFLAC(ctx, id); f != nil {
+// Playback can use any complete version the account can access. Permanent
+// downloads choose a quality independently through the downloads workspace.
+func (c *Cache) openNetEasePlayback(ctx context.Context, src music.Source, id string, mode OutputMode) (*neteaseFile, *music.Stream, error) {
+	if src == nil {
+		return nil, nil, errNoSource
+	}
+	var last error
+	for _, quality := range [...]string{"lossless", "high", "standard"} {
+		f, st, err := c.openNetEaseQuality(ctx, src, id, quality, mode != OutputCompatible)
+		if err == nil || ctx.Err() != nil {
+			return f, st, err
+		}
+		last = err
+	}
+	return nil, nil, last
+}
+
+func (c *Cache) openNetEaseQuality(ctx context.Context, src music.Source, id, quality string, stereo bool) (*neteaseFile, *music.Stream, error) {
+	if f, st := c.neteaseCachedAudio(ctx, id, quality, stereo); f != nil {
 		return f, st, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	st, err := src.Stream(id, "lossless")
+	st, err := src.Stream(id, quality)
+	if canceled := ctx.Err(); canceled != nil {
+		return nil, nil, canceled
+	}
 	if err != nil {
 		return nil, nil, err
 	}
-	if err = ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	if !isLosslessFLAC(st) || st.URL == "" {
-		return nil, nil, errors.New(i18n.T("NetEase did not return a lossless FLAC for this track"))
+	typ := neteaseStreamType(st, quality)
+	if typ == "" || st.URL == "" {
+		if quality == "lossless" {
+			return nil, nil, errors.New(i18n.T("NetEase did not return a lossless FLAC for this track"))
+		}
+		return nil, nil, music.ErrUnavailable
 	}
 	dir := ""
 	if c != nil {
@@ -110,7 +152,7 @@ func (c *Cache) openNeteaseFLAC(ctx context.Context, src music.Source, id string
 			os.Remove(part)
 		}
 	}()
-	n, err := fetchNeteaseFLAC(ctx, tmp, st)
+	n, err := fetchNeteaseAudio(ctx, tmp, st)
 	closeErr := tmp.Close()
 	if err == nil {
 		err = closeErr
@@ -118,32 +160,51 @@ func (c *Cache) openNeteaseFLAC(ctx context.Context, src music.Source, id string
 	if err != nil {
 		return nil, nil, err
 	}
-	if err = validateNeteaseFLAC(ctx, part, true); err != nil {
+	if err = validateNeteaseAudio(ctx, part, typ, stereo, true); err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		return nil, nil, errors.New(i18n.T("The downloaded NetEase file is not a complete playable FLAC"))
+		if typ == "flac" {
+			return nil, nil, errors.New(i18n.T("The downloaded NetEase file is not a complete playable FLAC"))
+		}
+		return nil, nil, errors.New(i18n.T("The downloaded NetEase audio could not be decoded"))
 	}
 	if err = ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	info := *st
-	info.URL, info.Headers, info.Type, info.Size = "", nil, "flac", n
+	info := neteaseStreamInfo(st, typ, quality, n)
 	path, kept := part, false
 	if c != nil {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		path, kept = c.keepLocked(neteaseSource, id, "lossless", &info, part, n)
+		path, kept = c.keepLocked(neteaseSource, id, quality, info, part, n)
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
 	part = "" // the cache or the transport now owns the file
-	return &neteaseFLAC{File: f, temporary: !kept}, &info, nil
+	return &neteaseFile{File: f, temporary: !kept}, info, nil
 }
 
-func fetchNeteaseFLAC(ctx context.Context, dst io.Writer, st *music.Stream) (int64, error) {
+func openNetEaseCompatible(ctx context.Context, cache *Cache, src music.Source, t music.Track, pre *neteaseAhead) (*music.Stream, stream, error) {
+	file, info, err := pre.take(ctx, cache, src, t.ID, OutputCompatible)
+	if err != nil {
+		return nil, nil, err
+	}
+	dl := opened(file.File, info.Size)
+	if file.temporary {
+		dl.part = file.Name()
+	}
+	s, err := openStream(dl, t.Duration)
+	if err != nil {
+		dl.Close()
+		return nil, nil, err
+	}
+	return info, s, nil
+}
+
+func fetchNeteaseAudio(ctx context.Context, dst io.Writer, st *music.Stream) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, st.URL, nil)
@@ -196,14 +257,18 @@ func fetchNeteaseFLAC(ctx context.Context, dst io.Writer, st *music.Stream) (int
 	return n, nil
 }
 
-func validateNeteaseFLAC(ctx context.Context, path string, complete bool) error {
-	d, err := decode.Open(ctx, path)
+func validateNeteaseAudio(ctx context.Context, path, typ string, stereo, complete bool) error {
+	open := decode.OpenProcessed
+	if typ == "flac" {
+		open = decode.Open
+	}
+	d, err := open(ctx, path)
 	if err != nil {
 		return err
 	}
 	defer d.Close()
 	info := d.Info()
-	if info.Container != "FLAC" {
+	if typ == "flac" && info.Container != "FLAC" || stereo && info.Format.Channels != 2 {
 		return decode.ErrUnsupported
 	}
 	samples := make([]int32, 4096*info.Format.Channels)

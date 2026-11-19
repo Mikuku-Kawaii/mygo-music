@@ -8,12 +8,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	engine "mygo-music/internal/audioengine/controller"
+	"mygo-music/internal/audioengine/decode"
 	"mygo-music/internal/audioengine/fixture"
 	"mygo-music/internal/audioengine/pcm"
 	"mygo-music/internal/music"
@@ -167,13 +169,206 @@ func TestNetEaseFLACRejectsIncompleteOrLossy(t *testing.T) {
 				return &music.Stream{URL: srv.URL, Type: "flac", Quality: tc.quality, Size: int64(tc.size)}, nil
 			}}}
 			cache := NewCache(t.TempDir(), 1<<20)
-			f, _, err := cache.openNeteaseFLAC(t.Context(), src, "a")
+			f, _, err := cache.openNetEaseQuality(t.Context(), src, "a", "lossless", true)
 			f.release()
 			entries, _ := os.ReadDir(cache.dir)
 			if err == nil || f != nil || len(entries) != 0 {
 				t.Fatalf("invalid download was accepted or kept: %v, %v", err, entries)
 			}
 		})
+	}
+}
+
+// An unavailable lossless source reports the service's reason in the playback snapshot.
+func TestNativeNetEaseFLACKeepsUnavailableReason(t *testing.T) {
+	const reason = "MP3 320 kbps"
+	src := &neteaseTestSource{controllerSource{request: func(string, string) (*music.Stream, error) {
+		return nil, music.Fail(music.ErrUnavailable, reason)
+	}}}
+	p, _ := nativePlayer(t, src)
+	p.PlayTrack([]music.Track{{Source: neteaseSource, ID: "a"}}, 0)
+	s := awaitPlayback(t, p, func(s PlaybackSnapshot) bool { return s.Error != "" })
+	if s.Error != reason {
+		t.Fatalf("unavailable reason lost: %q", s.Error)
+	}
+}
+
+// A full MP3 can play on the selected output when NetEase has no lossless stream.
+func TestNativeNetEaseFallsBackWithoutChangingOutput(t *testing.T) {
+	b, err := os.ReadFile("testdata/seek.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(b)
+	}))
+	defer srv.Close()
+	for _, tc := range []struct {
+		mode    OutputMode
+		quality string
+	}{
+		{OutputShared, "high"},
+		{OutputExclusive, "standard"},
+		{OutputProcessed, "high"},
+	} {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			requests := make(chan string, 8)
+			src := &neteaseTestSource{controllerSource{request: func(_ string, quality string) (*music.Stream, error) {
+				requests <- quality
+				if quality != tc.quality {
+					return nil, music.ErrUnavailable
+				}
+				return &music.Stream{URL: srv.URL, Type: "mp3", Quality: quality, Size: int64(len(b)), BitRate: 128000}, nil
+			}}}
+			cache := NewCache(t.TempDir(), 4<<20)
+			p, _ := nativePlayer(t, src)
+			p.Cache = cache
+			opened := make(chan *testNative, 1)
+			configs := make(chan engine.Config, 1)
+			p.controller.call(func(s *playbackState) {
+				s.openNative = func(c engine.Config) (nativeEngine, error) {
+					h := newTestNative()
+					opened <- h
+					configs <- c
+					return h, nil
+				}
+			})
+			prefs := OutputPreferences{Mode: tc.mode, EndpointID: "chosen-dac"}
+			prefs.DSP.PreampDB = -5
+			if err := p.SetOutput(prefs); err != nil {
+				t.Fatal(err)
+			}
+			p.PlayTrack([]music.Track{{Source: neteaseSource, ID: "mp3"}}, 0)
+			s := awaitPlayback(t, p, func(s PlaybackSnapshot) bool {
+				return s.Error != "" || s.AudioOutput.Native.EffectivePlaying
+			})
+			if s.Error != "" || s.Stream == nil || s.Stream.Type != "mp3" || s.Stream.Quality != tc.quality || s.Stream.BitRate != 128000 {
+				t.Fatalf("fallback stream: %+v, error: %q", s.Stream, s.Error)
+			}
+			h, cfg := <-opened, <-configs
+			h.mu.Lock()
+			media := h.media
+			h.mu.Unlock()
+			if !media.DecodeCompressed || cfg.Processing != (tc.mode == OutputProcessed) || cfg.Shared != (tc.mode == OutputShared) ||
+				cfg.EndpointID != prefs.EndpointID || cfg.DSP != prefs.DSP {
+				t.Fatalf("fallback changed the selected output: %+v", cfg)
+			}
+			d, err := decode.OpenProcessed(t.Context(), media.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d.Close()
+			if f, _ := cache.OpenNetEaseDownloadCache(t.Context(), "mp3"); f != nil {
+				f.Close()
+				t.Fatal("a playback fallback entered the lossless download cache")
+			}
+			want := []string{"lossless", "high"}
+			if tc.quality == "standard" {
+				want = append(want, "standard")
+			}
+			got := make([]string, 0, len(requests))
+			for len(requests) > 0 {
+				got = append(got, <-requests)
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("requested qualities %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// Both an explicit selection and a prefetched next song can skip an unavailable track.
+func TestNativeNetEaseSkipsUnavailableInPlayOrder(t *testing.T) {
+	for _, afterEnd := range []bool{false, true} {
+		t.Run(strconv.FormatBool(afterEnd), func(t *testing.T) {
+			buf, _ := testLosslessFLAC(t)
+			cache := NewCache(t.TempDir(), 1<<20)
+			for _, id := range []string{"first", "last"} {
+				path := filepath.Join(cache.dir, id+".part")
+				if err := os.WriteFile(path, buf, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := cache.keep(neteaseSource, id, "lossless", &music.Stream{Type: "flac", Quality: "lossless"}, path, int64(len(buf))); !ok {
+					t.Fatal("could not cache test track")
+				}
+			}
+			var requests atomic.Int32
+			src := &neteaseTestSource{controllerSource{request: func(id, _ string) (*music.Stream, error) {
+				if id != "missing" {
+					t.Errorf("unexpected request for %s", id)
+				}
+				requests.Add(1)
+				return nil, music.ErrUnavailable
+			}}}
+			p, opened := nativePlayer(t, src)
+			p.Cache = cache
+			queue := []music.Track{{Source: neteaseSource, ID: "first"}, {Source: neteaseSource, ID: "missing"}, {Source: neteaseSource, ID: "last"}}
+			waitFor := func(id string) PlaybackSnapshot {
+				return awaitPlayback(t, p, func(s PlaybackSnapshot) bool {
+					return s.Error != "" || s.Current.ID == id && s.AudioOutput.Native.EffectivePlaying
+				})
+			}
+			if afterEnd {
+				p.PlayQueue(queue, 0)
+				if s := waitFor("first"); s.Error != "" {
+					t.Fatal(s.Error)
+				}
+				nativeEnd(<-opened)
+			} else {
+				p.PlayTrack(queue, 1)
+			}
+			if s := waitFor("last"); s.Error != "" || s.Current.ID != "last" || requests.Load() != 3 {
+				t.Fatalf("did not advance past missing audio once: %s, %q, %d requests", s.Current.ID, s.Error, requests.Load())
+			}
+		})
+	}
+}
+
+// A queue without playable audio stops after one pass even with repeat-all enabled.
+func TestNativeNetEaseDoesNotLoopOnUnavailableQueue(t *testing.T) {
+	var requests atomic.Int32
+	src := &neteaseTestSource{controllerSource{request: func(_, _ string) (*music.Stream, error) {
+		requests.Add(1)
+		return nil, music.ErrUnavailable
+	}}}
+	p, _ := nativePlayer(t, src)
+	p.controller.call(func(s *playbackState) { s.repeat = RepeatAll })
+	queue := []music.Track{{Source: neteaseSource, ID: "a"}, {Source: neteaseSource, ID: "b"}}
+	p.PlayTrack(queue, 1)
+	s := awaitPlayback(t, p, func(s PlaybackSnapshot) bool { return s.Error != "" && !s.Playing })
+	if s.Current.ID != "a" || requests.Load() != 6 {
+		t.Fatalf("expected one pass through both tracks: %s, %d requests", s.Current.ID, requests.Load())
+	}
+}
+
+// The compatible decoder opens a lower-quality NetEase file at its reported quality.
+func TestNetEaseCompatiblePlaysLowerQuality(t *testing.T) {
+	data, err := os.ReadFile("testdata/seek.mp3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write(data) }))
+	defer srv.Close()
+	src := &neteaseTestSource{controllerSource{request: func(_ string, quality string) (*music.Stream, error) {
+		if quality != "high" {
+			return nil, music.ErrUnavailable
+		}
+		return &music.Stream{URL: srv.URL, Type: "mp3", Size: int64(len(data)), Quality: "high"}, nil
+	}}}
+	info, s, err := openNetEaseCompatible(t.Context(), NewCache(t.TempDir(), 0), src, music.Track{ID: "a", Duration: 5000}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl, _ := s.source()
+	path := dl.part
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info.Quality != "high" || info.Type != "mp3" || path == "" {
+		t.Fatalf("wrong fallback or file lease: %+v, %q", info, path)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("temporary fallback was not released: %v", err)
 	}
 }
 
@@ -195,7 +390,7 @@ func TestNetEaseFLACCancelsDownload(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		f, _, err := cache.openNeteaseFLAC(ctx, src, "a")
+		f, _, err := cache.openNetEaseQuality(ctx, src, "a", "lossless", true)
 		f.release()
 		result <- err
 	}()

@@ -39,16 +39,28 @@ test('the desktop request identifies one client and exposes a complete FLAC', as
   assert.deepEqual(Object.keys(stream.headers).sort(), ['Referer', 'User-Agent']);
 });
 
-test('lossless requests reject previews, wrong variants and non-CDN URLs', async t => {
+test('lossless refusal identifies the actual response without switching quality', async t => {
   let item;
-  const { plugin } = await pluginFor(t, () => ({ code: 200, data: [item] }));
-  for (const invalid of [
-    { freeTrialInfo: {} }, { type: 'mp3' }, { level: 'exhigh' },
-    { url: 'https://m1.music.126.net.evil.test/audio.flac' },
-  ]) {
+  let calls = 0;
+  const { plugin } = await pluginFor(t, () => { calls++; return { code: 200, data: [item] }; });
+  const variants = [
+    [{ freeTrialInfo: {} }, /试听片段/],
+    [{ type: 'mp3', level: 'exhigh', br: 320000 }, /MP3 320 kbps/],
+    [{ type: undefined }, /音源格式/],
+    [{ level: 'exhigh' }, /FLAC.*未标记/],
+  ];
+  for (const [invalid, message] of variants) {
     item = { ...audio, ...invalid };
-    await assert.rejects(plugin.stream({ id: '123', quality: 'lossless' }));
+    await assert.rejects(plugin.stream({ id: '123', quality: 'lossless' }), { code: 'unavailable', message });
   }
+  assert.equal(calls, variants.length);
+
+  item = { ...audio, url: 'https://m1.music.126.net.evil.test/audio.flac' };
+  await assert.rejects(plugin.stream({ id: '123', quality: 'lossless' }), /不支持的音频地址/);
+
+  item = { ...audio, type: 'mp3', level: 'exhigh', br: 320000 };
+  const result = await plugin.stream({ id: '123', quality: 'high' });
+  assert.deepEqual([result.type, result.bitRate, result.quality], ['mp3', 320000, 'high']);
 });
 
 test('content refusal keeps the current login and never tries another quality', async t => {

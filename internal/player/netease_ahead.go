@@ -6,20 +6,21 @@ import (
 	"mygo-music/internal/music"
 )
 
-// neteaseAhead holds one prepared file for the next track in native mode.
+// neteaseAhead holds one prepared file for the next NetEase track.
 // Its worker writes the result before closing done. The controller either
 // hands the job to a foreground load or discards it, transferring the lease.
 type neteaseAhead struct {
 	id     string
 	cancel context.CancelFunc
 	done   chan struct{}
-	file   *neteaseFLAC
+	file   *neteaseFile
 	info   *music.Stream
+	err    error
 }
 
 func (p *playbackState) getNetEaseAhead() {
 	t, ok := p.upNext()
-	if !ok || t.Source != neteaseSource || t.Unavailable {
+	if !ok || t.Source != neteaseSource || t.Unavailable || p.output.Mode == OutputDoP {
 		p.dropNetEaseAhead()
 		return
 	}
@@ -38,7 +39,7 @@ func (p *playbackState) getNetEaseAhead() {
 	if p.neteaseAheadGate == nil {
 		p.neteaseAheadGate = make(chan struct{}, 1)
 	}
-	cache, gate := p.Cache, p.neteaseAheadGate
+	cache, gate, mode := p.Cache, p.neteaseAheadGate, p.output.Mode
 	go func() {
 		defer close(a.done)
 		// A plugin Stream call may be unable to observe cancellation until it
@@ -49,7 +50,7 @@ func (p *playbackState) getNetEaseAhead() {
 		case gate <- struct{}{}:
 		}
 		defer func() { <-gate }()
-		a.file, a.info, _ = cache.openNeteaseFLAC(ctx, src, t.ID)
+		a.file, a.info, a.err = cache.openNetEasePlayback(ctx, src, t.ID, mode)
 	}()
 }
 
@@ -77,16 +78,16 @@ func (a *neteaseAhead) discard() {
 	}()
 }
 
-func (a *neteaseAhead) take(ctx context.Context) (*neteaseFLAC, *music.Stream) {
+func (a *neteaseAhead) take(ctx context.Context, cache *Cache, src music.Source, id string, mode OutputMode) (*neteaseFile, *music.Stream, error) {
 	if a == nil {
-		return nil, nil
+		return cache.openNetEasePlayback(ctx, src, id, mode)
 	}
 	select {
 	case <-ctx.Done():
 		a.discard()
-		return nil, nil
+		return nil, nil, ctx.Err()
 	case <-a.done:
 		a.cancel()
-		return a.file, a.info
+		return a.file, a.info, a.err
 	}
 }

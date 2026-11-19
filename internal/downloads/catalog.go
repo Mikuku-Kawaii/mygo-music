@@ -196,22 +196,24 @@ func trackItems(tracks []music.Track) []Item {
 	return items
 }
 
-// SourceError keeps the service's status visible and avoids storing URLs or
-// session data that can appear in network errors returned by a plugin.
+// sourceError displays the service's status and the source's user-facing
+// reason. Raw plugin errors can include request URLs and must stay out of the journal.
 func sourceError(err error, fallback string) error {
-	status := music.Reason(err)
-	if strings.Contains(err.Error(), "-460") {
-		return errors.New("NetEase rejected this request (-460)")
-	}
+	message := err.Error()
 	switch {
+	case strings.Contains(message, "-460"):
+		return errors.New("NetEase rejected this request (-460)")
+	case strings.HasPrefix(message, "[460] "):
+		return errors.New("NetEase rejected this request (460)")
 	case errors.Is(err, music.ErrSignIn):
 		return errors.New("Sign in to NetEase Music first")
 	case errors.Is(err, music.ErrSetup):
 		return errors.New("Set up the NetEase Music source first")
 	case errors.Is(err, music.ErrUnavailable):
+		if reason := music.Reason(err); reason != "" {
+			return errors.New(reason)
+		}
 		return errors.New("This track is unavailable to the current NetEase account")
-	case strings.Contains(status, "-460"):
-		return errors.New("NetEase rejected this request (-460)")
 	default:
 		return errors.New(fallback)
 	}

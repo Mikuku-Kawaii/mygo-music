@@ -22,8 +22,9 @@ import (
 type Item struct{ Source, ID, Title string }
 type Media struct {
 	Item
-	Path  string
-	Gains dsp.Gains
+	Path             string
+	Gains            dsp.Gains
+	DecodeCompressed bool // admit decoded PCM for a compressed playback fallback
 }
 type Config struct {
 	Shared        bool

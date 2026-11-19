@@ -40,11 +40,11 @@ func New(post func(func())) *Player {
 	return p
 }
 
-// DownloadPriorityBusy observes playback and its in-flight reads without
-// sending a command to the controller or changing the successor plan.
+// DownloadPriorityBusy gives loading and in-flight audio reads priority over
+// background downloads. Playback of prepared audio leaves downloads running.
 func (p *Player) DownloadPriorityBusy() bool {
 	s := p.controller.latest.Load()
-	if s.Playing || s.Loading || s.networkCurrent.inFlight() {
+	if s.Loading || s.networkCurrent.inFlight() {
 		return true
 	}
 	if s.netEaseAheadDone != nil {

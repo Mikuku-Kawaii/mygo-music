@@ -206,7 +206,7 @@ func waitOutput(ctx context.Context, released <-chan struct{}) error {
 	}
 }
 
-func (p *playbackState) loadNative(ctx context.Context, gen int, src music.Source, t music.Track, quality string, pre *neteaseAhead) {
+func (p *playbackState) loadNative(ctx context.Context, gen int, src music.Source, t music.Track, quality string, pre *neteaseAhead, skipped, dir int) {
 	config, released, gate := p.output, p.outputReleased, p.outputGate
 	visual := p.visual
 	cache := p.Cache
@@ -220,26 +220,33 @@ func (p *playbackState) loadNative(ctx context.Context, gen int, src music.Sourc
 		open = func(c engine.Config) (nativeEngine, error) { return engine.New(c) }
 	}
 	work := func() {
-		flac, info := pre.take(ctx)
-		defer func() { flac.release() }()
+		var file *neteaseFile
+		defer func() { file.release() }()
 		if ctx.Err() != nil {
+			if pre != nil {
+				pre.discard()
+			}
 			return
 		}
+		var info *music.Stream
 		var err error
+		var mediaFailed, compressed bool
 		path := ""
 		switch {
 		case src == nil:
 			err = errNoSource
+			mediaFailed = t.Source == neteaseSource
 		case config.Mode == OutputDoP && t.Source != "local":
 			err = errors.New(i18n.T("DoP needs a local stereo DSF or DFF file"))
 		case config.Mode == OutputASIO && config.ASIODriver == "":
 			err = errors.New(i18n.T("Select an ASIO driver first"))
 		case t.Source == neteaseSource && src.Info().Playback == music.PlaybackStream:
-			if flac == nil {
-				flac, info, err = cache.openNeteaseFLAC(ctx, src, t.ID)
-			}
-			if flac != nil {
-				path = flac.Name()
+			file, info, err = pre.take(ctx, cache, src, t.ID, config.Mode)
+			pre = nil
+			mediaFailed = err != nil
+			if file != nil {
+				path = file.Name()
+				compressed = info.Type != "flac"
 			}
 		case src.Info().Playback == music.PlaybackRemote || config.Mode == OutputProcessed && t.Source != "local":
 			err = errors.New(i18n.T("Native output requires a local audio file"))
@@ -248,6 +255,9 @@ func (p *playbackState) loadNative(ctx context.Context, gen int, src music.Sourc
 			if err == nil && info != nil {
 				path, _ = music.PathOf(info.URL)
 			}
+		}
+		if pre != nil {
+			pre.discard()
 		}
 		if err == nil && path == "" {
 			err = errors.New(i18n.T("Native output requires a local audio file"))
@@ -278,15 +288,16 @@ func (p *playbackState) loadNative(ctx context.Context, gen int, src music.Sourc
 				Processing: config.Mode == OutputProcessed, DSP: config.DSP, Next: next, InitialVolume: initialVolume, Analysis: visual})
 		}
 		if h != nil {
-			file, releaseOutput := flac, release
+			mediaFile, releaseOutput := file, release
 			h = &leasedNative{nativeEngine: h, release: func() {
-				file.release()
+				mediaFile.release()
 				releaseOutput()
 			}}
-			flac, release = nil, nil
+			file, release = nil, nil
 		}
 		if err == nil {
-			_, err = h.SetQueue(ctx, []engine.Media{{Item: engine.Item{Source: t.Source, ID: t.ID, Title: t.Name}, Path: path, Gains: nativeGains(src, t.ID, info)}}, 0)
+			_, err = h.SetQueue(ctx, []engine.Media{{Item: engine.Item{Source: t.Source, ID: t.ID, Title: t.Name}, Path: path,
+				Gains: nativeGains(src, t.ID, info), DecodeCompressed: compressed}}, 0)
 		}
 		if release != nil {
 			release()
@@ -313,7 +324,11 @@ func (p *playbackState) loadNative(ctx context.Context, gen int, src music.Sourc
 					go h.Close()
 				}
 				p.loading = false
-				p.loadFailed(t.Source, err, p.at, 0, stay)
+				if mediaFailed {
+					p.loadNetEaseFailed(err, skipped, dir)
+				} else {
+					p.loadFailed(t.Source, err, p.at, 0, stay)
+				}
 				return
 			}
 			p.native, p.info = h, cloneStream(info)

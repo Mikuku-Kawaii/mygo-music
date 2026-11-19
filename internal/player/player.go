@@ -240,8 +240,7 @@ func (p *playbackState) PlayQueue(tracks []music.Track, start int) {
 }
 
 // PlayTrack replaces the queue with tracks and plays the one at i, the
-// listener's pick: one that can't play stays, saying why, rather than another
-// playing in its place.
+// listener's pick. NetEase advances if it cannot supply playable audio.
 func (p *playbackState) PlayTrack(tracks []music.Track, i int) {
 	p.playQueue(tracks, i, stay)
 }
@@ -542,8 +541,7 @@ func (p *playbackState) Prev() {
 	p.loadSkipping(at, 0, back, true, 0)
 }
 
-// Jump plays the queue's track i, the listener's pick: one that can't play
-// stays, saying why.
+// Jump plays the queue's track i, the listener's pick.
 func (p *playbackState) Jump(i int) {
 	for k, v := range p.order {
 		if v == i {
@@ -842,8 +840,9 @@ func (p *playbackState) loadSkipping(at, skipped, dir int, play bool, from time.
 	p.loadCancel = cancel
 	t := p.queue[p.order[at]]
 	src := p.sourceOf(&t)
+	netEase := t.Source == neteaseSource && (src == nil || src.Info().Playback == music.PlaybackStream)
 	var neteasePre *neteaseAhead
-	if p.output.Mode != OutputCompatible {
+	if netEase {
 		neteasePre = p.takeNetEaseAhead(t, src)
 	}
 	if was := p.remote; was != nil && was.started && p.playing && (src == nil || src.Info().ID != was.src.Info().ID) {
@@ -872,7 +871,7 @@ func (p *playbackState) loadSkipping(at, skipped, dir int, play bool, from time.
 		if p.Quality != nil {
 			quality = p.Quality()
 		}
-		p.loadNative(ctx, gen, src, t, quality, neteasePre)
+		p.loadNative(ctx, gen, src, t, quality, neteasePre, skipped, dir)
 		return
 	}
 	if src != nil && src.Info().Playback == music.PlaybackRemote {
@@ -889,8 +888,16 @@ func (p *playbackState) loadSkipping(at, skipped, dir int, play bool, from time.
 	work := func() {
 		// Cache/configuration are captured before dispatch; workers never read
 		// mutable control state. Source APIs without context finish cooperatively.
-		opener := &playbackState{Cache: cache}
-		info, s, err := opener.openContext(ctx, src, t, quality, pre)
+		var info *music.Stream
+		var s stream
+		var err error
+		if netEase {
+			info, s, err = openNetEaseCompatible(ctx, cache, src, t, neteasePre)
+		} else {
+			opener := &playbackState{Cache: cache}
+			info, s, err = opener.openContext(ctx, src, t, quality, pre)
+		}
+		mediaFailed := netEase && err != nil
 		release, gateErr := acquireOutput(ctx, gate)
 		if gateErr == nil {
 			gateErr = waitOutput(ctx, released)
@@ -921,7 +928,11 @@ func (p *playbackState) loadSkipping(at, skipped, dir int, play bool, from time.
 			if err != nil {
 				// Shuffle can move the same selection while its source is opening.
 				// gen still owns the selection, but at may now name another song.
-				p.loadFailed(t.Source, err, p.at, skipped, dir)
+				if mediaFailed {
+					p.loadNetEaseFailed(err, skipped, dir)
+				} else {
+					p.loadFailed(t.Source, err, p.at, skipped, dir)
+				}
 				return
 			}
 			p.stream, p.info = s, info
@@ -1016,6 +1027,33 @@ func (p *playbackState) loadLyrics(gen int, src music.Source, t music.Track) {
 	}()
 }
 
+// Skipping follows the play order and does not resume a user-paused load.
+func (p *playbackState) loadNetEaseFailed(err error, skipped, dir int) {
+	if p.playing {
+		if dir == stay {
+			dir = forward
+		}
+		n := len(p.order)
+		next := p.at + dir
+		if next == n && p.feed != nil {
+			p.err = errorText(err)
+			p.awaitFeed()
+			p.sync()
+			return
+		}
+		if skipped+1 < n {
+			if dir == back || p.repeat == RepeatAll {
+				next = (next + n) % n
+			}
+			if next < n {
+				p.loadSkipping(next, skipped+1, dir, true, 0)
+				return
+			}
+		}
+	}
+	p.loadFailed(neteaseSource, err, p.at, skipped, stay)
+}
+
 // loadFailed says why the track at order[at] can't play, and skips it the way
 // dir goes, unless it stays, nothing in the queue can play, or the listener has
 // to do something first, which would stop the next track too.
@@ -1045,6 +1083,9 @@ func errorText(err error) string {
 	case errors.Is(err, errNoSource):
 		return i18n.T("The plugin of this song is gone")
 	case errors.Is(err, music.ErrUnavailable):
+		if reason := music.Reason(err); reason != "" {
+			return reason
+		}
 		return i18n.T("This song isn't available")
 	case errors.Is(err, music.ErrSignIn):
 		return i18n.T("Sign in to play this song")

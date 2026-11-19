@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"mygo-music/internal/audioengine/decode"
+	"mygo-music/internal/audioengine/dsp"
 	"mygo-music/internal/audioengine/output"
 	"mygo-music/internal/audioengine/pcm"
 	"mygo-music/internal/audioengine/render"
@@ -29,24 +30,20 @@ type nativeTransport struct {
 	latency, tail          int
 }
 
-func openNative(ctx context.Context, config Config, media Media, g pcm.Generation, position time.Duration) (transport, error) {
-	open := decode.Open
-	if config.DoP {
-		open = decode.OpenDoP
-	} else if config.Processing {
-		open = decode.OpenProcessed
-	}
-	d, err := open(ctx, media.Path)
-	if err != nil {
-		return nil, err
-	}
-	info := d.Info()
-	start, err := seekDecoder(ctx, d, position)
-	if err != nil {
-		d.Close()
-		return nil, err
-	}
+func nativeRenderSettings(config Config, media Media, info decode.Info) (pcm.Format, render.LiveOptions) {
 	f := info.Format
+	cfg, volume := config.DSP, config.InitialVolume
+	convert := media.DecodeCompressed && !config.Processing && !config.DoP && f.Kind != pcm.Integer
+	if convert {
+		// Submit source-rate PCM on the selected backend. This conversion
+		// leaves the compressed decoder's actual precision in Source.
+		f.Kind, f.ValidBits = pcm.Integer, 24
+		if info.Container == "mp3" {
+			// MyGo exposes go-mp3's 16-bit output as normalized float32.
+			f.ValidBits = 16
+		}
+		cfg, volume = dsp.Config{Bypass: true}, 1
+	}
 	// Choose a packed integer container from effective source precision, not
 	// the decoder's int32 workspace (notably FLAC16/24). No samples change.
 	switch {
@@ -70,17 +67,38 @@ func openNative(ctx context.Context, config Config, media Media, g pcm.Generatio
 			_, _ = rand.Read(seed[:])
 		}
 	}
-	// Session lifetime is NOT the command context: a later Pause must cancel
-	// obsolete preparation without canceling an already accepted audio stream.
-	life, cancel := context.WithCancel(context.Background())
 	if config.ASIO != "" {
 		config.Next = nil
 	}
-	p, err := render.StartLive(life, d, f, g, int64(start), render.LiveOptions{
-		Next: config.Next, Shared: config.Shared, Processing: config.Processing, DoP: config.DoP, StableBuffer: config.StableBuffer,
-		DSP: config.DSP, Gains: media.Gains,
-		Seed: binary.LittleEndian.Uint64(seed[:]), Volume: config.InitialVolume,
-	})
+	return f, render.LiveOptions{
+		Next: config.Next, Shared: config.Shared, Processing: config.Processing || convert, DoP: config.DoP, StableBuffer: config.StableBuffer,
+		DSP: cfg, Gains: media.Gains,
+		Seed: binary.LittleEndian.Uint64(seed[:]), Volume: volume,
+	}
+}
+
+func openNative(ctx context.Context, config Config, media Media, g pcm.Generation, position time.Duration) (transport, error) {
+	open := decode.Open
+	if config.DoP {
+		open = decode.OpenDoP
+	} else if config.Processing || media.DecodeCompressed {
+		open = decode.OpenProcessed
+	}
+	d, err := open(ctx, media.Path)
+	if err != nil {
+		return nil, err
+	}
+	info := d.Info()
+	start, err := seekDecoder(ctx, d, position)
+	if err != nil {
+		d.Close()
+		return nil, err
+	}
+	f, opt := nativeRenderSettings(config, media, info)
+	// Session lifetime is NOT the command context: a later Pause must cancel
+	// obsolete preparation without canceling an already accepted audio stream.
+	life, cancel := context.WithCancel(context.Background())
+	p, err := render.StartLive(life, d, f, g, int64(start), opt)
 	if err != nil {
 		cancel()
 		d.Close()

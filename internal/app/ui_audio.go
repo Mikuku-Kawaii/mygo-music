@@ -209,7 +209,7 @@ func (a *app) audioSettingsSection(c *ui.Context, p palette, row settingsRow, bl
 			formatHint = T("Local integer stereo WAV and FLAC at the source rate.")
 		}
 		if !dop && !asio {
-			formatHint += " " + T("NetEase songs play from a complete lossless FLAC.")
+			formatHint += " " + T("NetEase playback prefers lossless audio and can use a lower quality.")
 		}
 		row(T("Available Devices"), formatHint, func() {
 			label := T("Refresh")
@@ -354,14 +354,23 @@ func (a *app) audioSignalPath(c *ui.Context, p palette) {
 			if !dop {
 				detail(T("Decoded PCM"), decoded)
 			}
+			converted := !processed && (n.Source.Format.Kind == pcm.Float32 || n.Source.Format.Kind == pcm.Float64)
 			switch {
 			case dop:
 				detail(T("Processing"), T("DSD bits → DoP carrier → WASAPI exclusive"))
 			case asio:
-				detail(T("Processing"), T("Native integer PCM → lossless packing → ASIO driver"))
+				path := T("Native integer PCM → lossless packing → ASIO driver")
+				if converted {
+					path = T("Decoded audio → source-rate integer PCM → ASIO driver")
+				}
+				detail(T("Processing"), path)
 				detail(T("ASIO Channel Format"), pcmDescription(n.Output.DriverFormat))
 			case exclusive:
-				detail(T("Processing"), T("Native integer PCM → lossless packing → WASAPI exclusive. No resampling or software gain."))
+				path := T("Native integer PCM → lossless packing → WASAPI exclusive. No resampling or software gain.")
+				if converted {
+					path = T("Decoded audio → source-rate integer PCM → WASAPI exclusive")
+				}
+				detail(T("Processing"), path)
 			case processed:
 				path := T("Decoded PCM → float64 DSP → integer PCM → WASAPI exclusive")
 				if n.Source.DSDRate != 0 {
@@ -408,7 +417,11 @@ func (a *app) audioSignalPath(c *ui.Context, p palette) {
 					detail(T("Applied Gain"), Tf("%.3f · config revision %d", n.AppliedVolume, n.AppliedGeneration.Config))
 				}
 			default:
-				detail(T("Processing"), T("Native integer PCM → Windows stream volume → system sample-rate/channel conversion → shared mixer. This is not bit-perfect output."))
+				path := T("Native integer PCM → Windows stream volume → system sample-rate/channel conversion → shared mixer. This is not bit-perfect output.")
+				if converted {
+					path = T("Decoded audio → source-rate integer PCM → Windows shared mixer")
+				}
+				detail(T("Processing"), path)
 				detail(T("Windows Mix Format"), pcmDescription(n.Output.MixFormat))
 				gain := T("Not confirmed")
 				if n.Output.Format.Rate > 0 {

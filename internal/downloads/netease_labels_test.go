@@ -17,6 +17,29 @@ type labelTransport func(*http.Request) (*http.Response, error)
 
 func (f labelTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+// The download queue keeps an explicit refusal reason and excludes raw network errors.
+func TestNetEaseDownloadKeepsUnavailableReason(t *testing.T) {
+	const reason = "MP3 320 kbps"
+	const fallback = "Could not resolve NetEase audio"
+	if got := sourceError(music.Fail(music.ErrUnavailable, reason), fallback); got.Error() != reason {
+		t.Fatalf("unavailable reason lost: %v", got)
+	}
+	raw := errors.New("GET https://m1.music.126.net/audio.mp3?token=fixture: offline")
+	if got := sourceError(raw, fallback); got.Error() != fallback {
+		t.Fatalf("raw error escaped into the queue: %v", got)
+	}
+}
+
+// The queue shows the status when the plugin reports a signed or unsigned service refusal.
+func TestNetEaseDownloadKeepsRefusalCode(t *testing.T) {
+	for _, status := range []string{"-460", "460"} {
+		reported := errors.New("[" + status + "] service refused the stream")
+		if got := sourceError(reported, "Could not resolve NetEase audio"); !strings.HasSuffix(got.Error(), "("+status+")") {
+			t.Fatalf("service status %s was lost: %v", status, got)
+		}
+	}
+}
+
 // A song link exposes the returned credits, without sending cookies or using
 // the music source to resolve an audio stream.
 func TestNetEaseLinkUsesPublicCredits(t *testing.T) {

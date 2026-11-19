@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,8 +105,8 @@ func TestHTTPSQueueResumeAfterRestart(t *testing.T) {
 			}))
 			defer server.Close()
 			e := &Engine{HTTP: server.Client()}
-			var playback atomic.Bool
-			q, err := Open(journal, e, playback.Load, nil)
+			var priorityBusy atomic.Bool
+			q, err := Open(journal, e, priorityBusy.Load, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -128,7 +129,7 @@ func TestHTTPSQueueResumeAfterRestart(t *testing.T) {
 				time.Sleep(15 * time.Millisecond)
 			}
 			if !tc.change {
-				playback.Store(true)
+				priorityBusy.Store(true)
 				pollTask(t, q, active.ID, Queued)
 			}
 			q.Close()
@@ -200,7 +201,8 @@ func (r rejectMediaRequest) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, io.ErrUnexpectedEOF
 }
 
-func TestNetEaseBatchPlaybackPriorityAndArchive(t *testing.T) {
+// Failed source resolution and invalid FLAC both leave later jobs free to finish.
+func TestNetEaseBatchSkipsFailedJobs(t *testing.T) {
 	b := flacFixture(t, 1)
 	folder := t.TempDir()
 	const oldFile = "user's existing file"
@@ -221,18 +223,20 @@ func TestNetEaseBatchPlaybackPriorityAndArchive(t *testing.T) {
 		w.Write(b)
 	}))
 	defer server.Close()
+	noAudio := errors.New("the source did not return an audio URL")
 	e := &Engine{HTTP: server.Client(), NetEase: func(_ context.Context, r Request) (NetEaseMedia, error) {
 		requested.Add(1)
 		if r.Format != Lossless {
 			t.Error("lossless format was lost")
 		}
+		if r.Item.ID == "missing" {
+			return NetEaseMedia{}, noAudio
+		}
 		return NetEaseMedia{Stream: &music.Stream{URL: server.URL + "/" + r.Item.ID + ".flac", Size: int64(len(b)),
 			Type: "flac", Quality: "lossless", Headers: map[string]string{"Referer": "https://music.163.com/"}}}, nil
 	}}
-	var playing atomic.Bool
-	playing.Store(true)
 	journal := filepath.Join(t.TempDir(), "queue.json")
-	q, err := Open(journal, e, playing.Load, nil)
+	q, err := Open(journal, e, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,20 +244,22 @@ func TestNetEaseBatchPlaybackPriorityAndArchive(t *testing.T) {
 	req := func(id string) Request {
 		return Request{Item: Item{Provider: NetEase, ID: id, Title: "same name"}, Folder: folder, Format: Lossless}
 	}
-	if n, err := q.Enqueue([]Request{req("1"), req("2")}); n != 2 || err != nil {
+	if n, err := q.Enqueue([]Request{req("missing"), req("2"), req("1")}); n != 3 || err != nil {
 		t.Fatalf("added %d: %v", n, err)
 	}
 	tasks, _ := q.Snapshot()
-	time.Sleep(240 * time.Millisecond)
-	if requested.Load() != 0 {
-		t.Fatal("a batch transfer ran while the playback gate was held")
-	}
-	playing.Store(false)
-	first := pollTask(t, q, tasks[0].ID, Complete)
+	finished := pollTask(t, q, tasks[2].ID, Complete)
+	missing := pollTask(t, q, tasks[0].ID, Failed)
 	pollTask(t, q, tasks[1].ID, Failed)
-	saved, err := os.ReadFile(filepath.Join(folder, first.Artifacts[0].Name))
-	if err != nil || !bytes.Equal(saved, b) || first.Artifacts[0].Name != "same name (2).flac" {
-		t.Fatalf("archive: %+v, %v", first.Artifacts, err)
+	if missing.Error != noAudio.Error() || requested.Load() != 3 {
+		t.Fatalf("source failure was retried or lost: %q, %d requests", missing.Error, requested.Load())
+	}
+	if len(finished.Artifacts) != 1 || finished.Artifacts[0].Name != "same name (2).flac" {
+		t.Fatalf("archive: %+v", finished.Artifacts)
+	}
+	saved, err := os.ReadFile(filepath.Join(folder, finished.Artifacts[0].Name))
+	if err != nil || !bytes.Equal(saved, b) {
+		t.Fatalf("archived audio changed: %v", err)
 	}
 	orig, err := os.ReadFile(filepath.Join(folder, "same name.flac"))
 	if err != nil || string(orig) != oldFile {

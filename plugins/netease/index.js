@@ -949,9 +949,10 @@ async function loadStream(id, level, activeSession, generation) {
 function playbackStream(data, id, level) {
   if (!Array.isArray(data.data)) throw new Error("网易云返回了无效的音源数据");
   const audio = data.data.find((item) => String(item?.id) === id);
-  if (!audio || !audio.url || (audio.code !== undefined && Number(audio.code) !== 200) || audio.freeTrialInfo != null) {
+  if (!audio || !audio.url || (audio.code !== undefined && Number(audio.code) !== 200)) {
     throw fail("unavailable", "当前账号无完整播放权限，或歌曲在当前地区不可用");
   }
+  if (audio.freeTrialInfo != null) throw fail("unavailable", "网易云仅开放了这首歌的试听片段");
   let url;
   try { url = new URL(secureURL(audio.url)); } catch {
     throw new Error("网易云返回了无效的音频地址");
@@ -961,12 +962,19 @@ function playbackStream(data, id, level) {
   }
   const type = String(audio.type || "mp3").toLowerCase();
   if (!["mp3", "flac", "ogg", "m4a", "mp4", "aac"].includes(type)) throw fail("unavailable", "该歌曲的音频格式暂不支持");
+  const bitRate = Number.isSafeInteger(audio.br) && audio.br > 0 ? audio.br : 0;
   const lossless = type === "flac" && ["lossless", "hires", "jymaster"].includes(audio.level);
-  if (level === "lossless" && !lossless) throw new Error("网易云未提供完整的无损 FLAC 音源");
+  if (level === "lossless" && !lossless) {
+    if (!audio.type) throw fail("unavailable", "网易云未说明返回的音源格式，无法确认无损 FLAC");
+    if (type === "flac") throw fail("unavailable", "网易云返回的 FLAC 未标记为可用的无损音质");
+    const kbps = Math.round(bitRate / 1000);
+    const format = kbps > 0 ? `${type.toUpperCase()} ${kbps} kbps` : type.toUpperCase();
+    throw fail("unavailable", `网易云此次返回 ${format}，未提供请求的无损 FLAC`);
+  }
   return {
     url: url.toString(), type,
     size: Number.isSafeInteger(audio.size) && audio.size > 0 ? audio.size : 0,
-    bitRate: Number.isSafeInteger(audio.br) && audio.br > 0 ? audio.br : 0,
+    bitRate,
     quality: lossless ? "lossless" : audio.level === "standard" ? "standard" : "high",
     gain: Number.isFinite(audio.gain) ? audio.gain : 0,
     peak: Number.isFinite(audio.peak) ? audio.peak : 0,

@@ -51,8 +51,14 @@ func (p *playbackState) getAhead(quality string) {
 		p.dropAhead()
 	}
 	if !ok {
+		p.dropNetEaseAhead()
 		return
 	}
+	if t.Source == neteaseSource {
+		p.getNetEaseAhead()
+		return
+	}
+	p.dropNetEaseAhead()
 	src := p.sourceOf(&t)
 	if src == nil || src.Info().Playback == music.PlaybackRemote {
 		return
