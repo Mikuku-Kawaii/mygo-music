@@ -88,8 +88,7 @@ type settings struct {
 	// keeps none.
 	CacheMB int `json:"cacheMB"`
 	// SearchHistory keeps submitted keywords, most recent first.
-	SearchHistory  []string `json:"searchHistory,omitempty"`
-	DownloadFolder string   `json:"downloadFolder,omitempty"`
+	SearchHistory []string `json:"searchHistory,omitempty"`
 
 	path string // where they were loaded from, and are saved to
 }

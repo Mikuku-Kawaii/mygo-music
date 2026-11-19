@@ -43,9 +43,6 @@ type PlaybackSnapshot struct {
 	failureSeq                                          uint64
 	failureSource                                       string
 	failureError                                        error
-	networkAhead                                        *ahead
-	netEaseAheadDone                                    <-chan struct{}
-	networkCurrent                                      *download
 }
 
 type controlCall struct {
@@ -318,15 +315,6 @@ func (c *PlaybackController) publish(refresh bool) {
 		// The controller replaces these lyrics as a whole. Callers get copies through the facade.
 		s.Lyrics, s.LyricsLoaded = p.lyrics, p.lyricsLoaded
 		s.Artwork = c.artwork // replaced, never mutated
-		s.networkAhead = p.ahead
-		s.netEaseAheadDone = nil
-		if p.neteaseAhead != nil {
-			s.netEaseAheadDone = p.neteaseAhead.done
-		}
-		s.networkCurrent = nil
-		if p.stream != nil {
-			s.networkCurrent, _ = p.stream.source()
-		}
 	}
 	s.Playing, s.Loading, s.Ready = p.Playing(), p.Loading(), p.Ready()
 	s.Position, s.Duration = p.Position(), p.Duration()

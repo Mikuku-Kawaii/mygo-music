@@ -34,10 +34,7 @@ func (a *app) view(c *ui.Context) {
 		c.Root().Background(ui.Transparent)
 	}
 	root := ui.Box(c).Fill()
-	d := a.downloads
-	editingDownload := a.route.page == pageDownloads &&
-		(c.Focused(d.search) || c.Focused(d.qbURLInput) || c.Focused(d.qbUserInput) || c.Focused(d.qbPassInput))
-	if !c.Focused(a.searchBox) && !editingDownload {
+	if !c.Focused(a.searchBox) {
 		// Space plays and pauses wherever the focus is, as in Music. On
 		// the container around everything, it comes before a button the
 		// pointer focused, which would take Space as a click; on the
@@ -48,7 +45,6 @@ func (a *app) view(c *ui.Context) {
 		c.OnShortcut(0, ui.KeySpace, a.pl.TogglePlay)
 	}
 	npOpen, npSettled := a.npState(c)
-	d.visible.Store(a.route.page.inDownloads() && !(npOpen && npSettled))
 	root.Children(func() {
 		page := ui.Row(c).Fill().AlignItems(ui.Stretch)
 		page.Children(func() {
@@ -96,11 +92,6 @@ func (a *app) shortcuts(c *ui.Context) {
 	c.OnShortcut(ui.Cmd, ui.KeyBracketRight, a.goForward)
 	c.OnShortcut(ui.Cmd, ui.KeyF, func() {
 		a.nowPlaying = false
-		if a.route.page.inDownloads() {
-			a.open(route{page: pageDownloads})
-			a.downloads.search.Focus(c)
-			return
-		}
 		a.searchBox.Focus(c)
 	})
 	if a.nowPlaying {
@@ -141,9 +132,6 @@ func (a *app) show(r route) {
 		lib = a.library
 	}
 	a.activate(lib)
-	if lib.downloads != r.page.inDownloads() {
-		r = route{page: lib.landingPage(), src: lib.id}
-	}
 	a.route = r
 	if r.page == pageSearch {
 		a.query, a.searched = r.query, r
@@ -190,8 +178,6 @@ func (a *app) load(r route) {
 		if r.id != "" {
 			a.loadBrowse(lib, r.id, false)
 		}
-	case pageDownloadQueue, pageDownloadCompleted:
-		a.refreshDownloadLabels()
 	}
 }
 
@@ -260,9 +246,6 @@ func (a *app) navItem(c *ui.Context, icon *ui.SVG, label string, r route) {
 	p := a.pal
 	selected := a.route.page == r.page && !a.nowPlaying && (r.page != pageBrowse || a.route.id == r.id)
 	b := ui.ButtonBase(c.Key(label)).Height(34).PaddingX(10).Gap(10).Radius(8).AlignItems(ui.Center).Justify(ui.Start).FocusRing(false)
-	if r.page == pageDownloadQueue {
-		b.Label(label)
-	}
 	bg := ui.Transparent
 	switch {
 	case selected:
@@ -278,12 +261,6 @@ func (a *app) navItem(c *ui.Context, icon *ui.SVG, label string, r route) {
 	b.Children(func() {
 		ui.Icon(c, icon).Size(17, 17).TextColor(color)
 		ui.Text(c, label).FontSize(13.5).FontWeight(500).TextColor(p.text)
-		if r.page == pageDownloadQueue && a.downloads.queue != nil {
-			if n := a.downloads.queue.PendingCount(); n > 0 {
-				ui.Box(c).Grow(1)
-				ui.Textf(c, "%d", n).FontSize(12).FontFeatures("tnum").TextColor(p.muted)
-			}
-		}
 	})
 	if b.Clicked() {
 		a.open(r)
@@ -430,10 +407,6 @@ func (a *app) content(c *ui.Context) {
 		a.browsePage(c)
 	case pageSection:
 		a.sectionPage(c)
-	case pageDownloads:
-		a.downloadPage(c)
-	case pageDownloadQueue, pageDownloadCompleted:
-		a.downloadQueuePage(c, a.route.page == pageDownloadCompleted)
 	}
 }
 
@@ -633,13 +606,6 @@ var builtinPages = map[string]struct {
 // sidebarItems is what the source's Navigation says the sidebar has, or else an
 // entry for each of the app's pages it can do.
 func (a *app) sidebarItems() []sidebarItem {
-	if a.library.downloads {
-		return []sidebarItem{
-			{iconSearch, T("Search and Downloads"), route{page: pageDownloads}},
-			{iconQueue, T("Download Queue"), route{page: pageDownloadQueue}},
-			{iconCheck, T("Completed"), route{page: pageDownloadCompleted}},
-		}
-	}
 	var items []sidebarItem
 	nav := a.src.Info().Navigation
 	if len(nav) == 0 {

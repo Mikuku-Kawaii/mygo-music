@@ -9,6 +9,9 @@ export default ({ command }: { command: string }) => ({
   out: "build",
   resources: ["LICENSE"],
   urlSchemes: [command === "dev" ? "mygo-music-dev" : "mygo-music"],
+  windows: {
+    installerInclude: "installer.nsh",
+  },
   macos: {
     icon: "icon/AppIcon.icon",
     minimumSystemVersion: "13.0",

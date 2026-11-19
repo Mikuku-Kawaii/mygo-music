@@ -88,17 +88,7 @@ func (c *Cache) neteaseCachedAudio(ctx context.Context, id, quality string, ster
 	return nil, nil
 }
 
-// OpenNetEaseDownloadCache hands the downloads workspace a read lease on an
-// existing FLAC. It never starts or joins a playback load.
-func (c *Cache) OpenNetEaseDownloadCache(ctx context.Context, id string) (*os.File, *music.Stream) {
-	if f, st := c.neteaseCachedAudio(ctx, id, "lossless", false); f != nil {
-		return f.File, st
-	}
-	return nil, nil
-}
-
-// Playback can use any complete version the account can access. Permanent
-// downloads choose a quality independently through the downloads workspace.
+// Playback can use any complete version the account can access.
 func (c *Cache) openNetEasePlayback(ctx context.Context, src music.Source, id string, mode OutputMode) (*neteaseFile, *music.Stream, error) {
 	if src == nil {
 		return nil, nil, errNoSource

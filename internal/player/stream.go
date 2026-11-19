@@ -245,15 +245,6 @@ func (d *download) Progress() float64 {
 	return float64(d.n) / float64(d.size)
 }
 
-func (d *download) inFlight() bool {
-	if d == nil {
-		return false
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return !d.done
-}
-
 // waitFor waits until n bytes are in, or the download ended, and returns
 // how many there are.
 func (d *download) waitFor(n int64) int64 {

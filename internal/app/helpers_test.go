@@ -378,7 +378,7 @@ func addFake(a *app, src music.Source) *library {
 
 // newTestApp is an app with one source, a fakeSource called "fake": see fake.
 func newTestApp() *app {
-	a := &app{signInOver: new(atomic.Pointer[mygo.Window]), settings: defaultSettings(), settingText: map[string]*string{}, lyricAt: -1, queueAt: -1, downloads: &downloadWorkspace{}}
+	a := &app{signInOver: new(atomic.Pointer[mygo.Window]), settings: defaultSettings(), settingText: map[string]*string{}, lyricAt: -1, queueAt: -1}
 	a.library = addFake(a, newFakeSource("fake"))
 	fake(a).stream = func(string, string) (*music.Stream, error) {
 		<-fixturePlaybackStop

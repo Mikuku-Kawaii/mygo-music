@@ -3,7 +3,6 @@ package app
 import (
 	"errors"
 	"fmt"
-	"mygo-music/internal/plugin"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,10 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
 	"mygo-music/internal/i18n"
+	"mygo-music/internal/local"
 	"mygo-music/internal/music"
+	"mygo-music/internal/plugin"
 )
 
 // addOther adds a second source, called Other, whose pages and sidebar a test
@@ -38,6 +40,40 @@ func chooseSource(t *testing.T, tt *ui.Tester, name string) {
 		t.Fatal(err)
 	}
 	tt.Frame()
+}
+
+// A saved selection of the retired workspace falls back even with old bundled files present.
+func TestRetiredDownloadSourceFallsBackToLibrary(t *testing.T) {
+	data, _ := mygo.App.Path(mygo.PathUserData)
+	resources, _ := mygo.App.Path(mygo.PathResources)
+	images := music.ImageHeaders
+	t.Cleanup(func() {
+		mygo.App.SetPath(mygo.PathUserData, data)
+		mygo.App.SetPath(mygo.PathResources, resources)
+		music.ImageHeaders = images
+	})
+	resourceFixture := t.TempDir()
+	mygo.App.SetPath(mygo.PathUserData, t.TempDir())
+	mygo.App.SetPath(mygo.PathResources, resourceFixture)
+	const retired = "media-downloads"
+	legacy := filepath.Join(resourceFixture, retired)
+	if err := os.Mkdir(legacy, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const manifest = `{"id":"media-downloads","name":"Search and Downloads","version":"0.0.1","main":"index.js","playback":"stream","workspace":"downloads"}`
+	if err := os.WriteFile(filepath.Join(legacy, "plugin.json"), []byte(manifest), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "index.js"), []byte(`export const workspace = "downloads";`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{settings: defaultSettings()}
+	a.settings.Source = retired
+	a.makeSources()
+	t.Cleanup(a.closeSources)
+	if a.library.id != local.ID || a.route != (route{page: pageHome, src: local.ID}) || a.libOf(retired) != nil {
+		t.Fatalf("unexpected source or route after upgrade: %q, %+v", a.library.id, a.route)
+	}
 }
 
 // The sidebar's switcher only shows once there's another source to choose.

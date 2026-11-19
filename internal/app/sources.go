@@ -53,12 +53,10 @@ func probeCaps(src music.Source) map[string]bool {
 // so an answer that comes after the listener switched to another source lands
 // where it belongs, and shows when they come back.
 type library struct {
-	id        string
-	src       music.Source
-	caps      map[string]bool // what it can do
-	started   bool            // what it lists was asked for
-	bundled   bool
-	downloads bool
+	id      string
+	src     music.Source
+	caps    map[string]bool // what it can do
+	started bool            // what it lists was asked for
 
 	account      *music.Account
 	accountBusy  bool // it's being asked who's signed in
@@ -114,18 +112,9 @@ type library struct {
 }
 
 func newLibrary(src music.Source) *library {
-	info := src.Info()
-	lib := &library{id: info.ID, src: src, caps: probeCaps(src),
-		downloads: info.ID == downloadsID && info.Workspace == "downloads"}
+	lib := &library{id: src.Info().ID, src: src, caps: probeCaps(src)}
 	lib.forget()
 	return lib
-}
-
-func (l *library) landingPage() pageKind {
-	if l.downloads {
-		return pageDownloads
-	}
-	return pageHome
 }
 
 // forget drops what was loaded of the source, whose answers may have changed.
@@ -204,9 +193,6 @@ func (a *app) startLibrary(lib *library) {
 		return
 	}
 	lib.started = true
-	if lib.downloads {
-		return
-	}
 	a.loadAccount(lib)
 	a.loadMine(lib)
 	a.loadHome(lib)
@@ -228,7 +214,7 @@ func (a *app) activate(lib *library) {
 // switchSource goes to a source's Home, as the sidebar's switcher does.
 func (a *app) switchSource(id string) {
 	if lib := a.libOf(id); lib != nil && lib != a.library {
-		a.open(route{page: lib.landingPage(), src: id})
+		a.open(route{page: pageHome, src: id})
 	}
 }
 

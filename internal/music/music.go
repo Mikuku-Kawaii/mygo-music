@@ -331,12 +331,11 @@ type SettingOption struct {
 
 // Info is how a source introduces itself.
 type Info struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Version   string    `json:"version,omitempty"`
-	Workspace string    `json:"workspace,omitempty"`
-	Playback  Playback  `json:"playback"`
-	Settings  []Setting `json:"settings,omitempty"`
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	Version  string    `json:"version,omitempty"`
+	Playback Playback  `json:"playback"`
+	Settings []Setting `json:"settings,omitempty"`
 	// Navigation is the sidebar while the source is active, in this order. With
 	// none, the sidebar has an entry for each of the app's pages the source can do.
 	Navigation []NavItem `json:"navigation,omitempty"`

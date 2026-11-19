@@ -73,9 +73,6 @@ func TestNativeNetEasePrefetchHandoff(t *testing.T) {
 			if job == nil {
 				t.Fatal("prefetch did not belong to the playback queue")
 			}
-			if !p.DownloadPriorityBusy() {
-				t.Fatal("an in-flight next track did not get priority over downloads")
-			}
 			waitPrepared := func() {
 				select {
 				case <-job.done:
@@ -91,8 +88,8 @@ func TestNativeNetEasePrefetchHandoff(t *testing.T) {
 				if info, err := os.Stat(nextPath); err != nil || info.Size() != int64(len(b)) {
 					t.Fatal("validated next track did not reach the cache")
 				}
-				if !p.Playing() || p.DownloadPriorityBusy() {
-					t.Fatal("playback of a prepared track did not allow background downloads")
+				if !p.Playing() {
+					t.Fatal("completing the prefetch interrupted the current track")
 				}
 				current.change(func(s *engine.Snapshot) { s.State, s.EffectivePlaying = engine.Ended, false })
 			case "in flight":

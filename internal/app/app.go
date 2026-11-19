@@ -33,14 +33,7 @@ const (
 	pageSavedAlbums
 	pageBrowse
 	pageSection
-	pageDownloads
-	pageDownloadQueue
-	pageDownloadCompleted
 )
-
-func (p pageKind) inDownloads() bool {
-	return p == pageDownloads || p == pageDownloadQueue || p == pageDownloadCompleted
-}
 
 type route struct {
 	page pageKind
@@ -80,7 +73,6 @@ type app struct {
 
 	captions  captionState    // the episode playing's captions, and the model they take
 	installer pluginInstaller // installing and updating plugins
-	downloads *downloadWorkspace
 	// links are the app's links opened before its window was made, macOS
 	// handing over the one it was started with first.
 	links []string
@@ -256,13 +248,12 @@ func (a *app) makeSources() {
 			a.allLibs = append(a.allLibs, lib)
 		}
 	}
-	a.addBundledDownloads()
 	a.enabledChanged()
 	a.library = a.libs[0]
 	if lib := a.libOf(a.settings.Source); lib != nil {
 		a.library = lib
 	}
-	a.route = route{page: a.library.landingPage(), src: a.library.id}
+	a.route = route{page: pageHome, src: a.library.id}
 	a.local.OnChange(func() {
 		a.post(func() { a.libraryChanged(builtIn) })
 	})
@@ -292,7 +283,6 @@ func (a *app) enabledChanged() {
 	if a.pl != nil {
 		a.pl.RefreshConfiguration()
 	}
-	a.refreshDownloadSources()
 }
 
 // setPluginEnabled turns a plugin on or off. Off, it stops, its pages go, and if
@@ -353,7 +343,6 @@ func Run() error {
 		lyricAt:     -1,
 		queueAt:     -1,
 		cacheUsed:   -1,
-		downloads:   &downloadWorkspace{},
 	}
 	// Application updates for this build are installed manually.
 	mygo.App.WhenReady(func() {
@@ -405,7 +394,6 @@ func Run() error {
 		}
 		a.setMenu()
 		a.boot()
-		a.initDownloads()
 		// The notch player is macOS's, over its menu bar: elsewhere it would
 		// hang at the top of the screen as a black box.
 		if runtime.GOOS == "darwin" {
@@ -460,7 +448,6 @@ func Run() error {
 	// the pointer passes over it.
 	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
 		a.cancelLoudness()
-		a.stopDownloads()
 		if a.pl != nil {
 			a.pl.Close()
 		}

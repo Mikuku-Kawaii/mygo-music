@@ -258,9 +258,9 @@ func TestNativeNetEaseFallsBackWithoutChangingOutput(t *testing.T) {
 				t.Fatal(err)
 			}
 			d.Close()
-			if f, _ := cache.OpenNetEaseDownloadCache(t.Context(), "mp3"); f != nil {
-				f.Close()
-				t.Fatal("a playback fallback entered the lossless download cache")
+			if f, _ := cache.neteaseCachedAudio(t.Context(), "mp3", "lossless", true); f != nil {
+				f.release()
+				t.Fatal("a playback fallback entered the lossless cache")
 			}
 			want := []string{"lossless", "high"}
 			if tc.quality == "standard" {

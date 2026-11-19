@@ -40,31 +40,6 @@ func New(post func(func())) *Player {
 	return p
 }
 
-// DownloadPriorityBusy gives loading and in-flight audio reads priority over
-// background downloads. Playback of prepared audio leaves downloads running.
-func (p *Player) DownloadPriorityBusy() bool {
-	s := p.controller.latest.Load()
-	if s.Loading || s.networkCurrent.inFlight() {
-		return true
-	}
-	if s.netEaseAheadDone != nil {
-		select {
-		case <-s.netEaseAheadDone:
-		default:
-			return true
-		}
-	}
-	if a := s.networkAhead; a != nil {
-		select {
-		case <-a.done:
-			return a.dl.inFlight()
-		default:
-			return true
-		}
-	}
-	return false
-}
-
 // notifications keeps at most one UI update outstanding. Even a UI that never
 // executes that update cannot stop source completion, progress or natural next.
 func (p *Player) notifications() {
